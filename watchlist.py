@@ -8,6 +8,8 @@ import html
 from pathlib import Path
 from datetime import datetime, timedelta
 
+from populate_names import enrich as enrich_ticker_meta
+
 st.set_page_config(page_title="Stock Monitor", layout="wide")
 
 
@@ -108,8 +110,10 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ticker_names (
-                ticker TEXT PRIMARY KEY,
-                name   TEXT
+                ticker   TEXT PRIMARY KEY,
+                name     TEXT,
+                exchange TEXT,
+                currency TEXT
             )
             """
         )
@@ -120,6 +124,13 @@ def init_db():
         if "position" not in cols:
             conn.execute("ALTER TABLE watchlists ADD COLUMN position INTEGER")
             conn.execute("UPDATE watchlists SET position = id WHERE position IS NULL")
+
+        # Migrate ticker_names created before the exchange/currency columns existed
+        tn_cols = [r[1] for r in conn.execute("PRAGMA table_info('ticker_names')").fetchall()]
+        if "exchange" not in tn_cols:
+            conn.execute("ALTER TABLE ticker_names ADD COLUMN exchange TEXT")
+        if "currency" not in tn_cols:
+            conn.execute("ALTER TABLE ticker_names ADD COLUMN currency TEXT")
 
         # Seed defaults only if the DB is empty
         empty = conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0] == 0
@@ -269,21 +280,25 @@ def get_all_tags() -> list[str]:
     return sorted(set(TAGS) | set(used))
 
 
-def get_ticker_names() -> dict[str, str]:
-    """Manually-maintained display names, keyed by ticker. Empty names are omitted."""
+def get_ticker_meta() -> dict[str, tuple]:
+    """All stored metadata keyed by ticker: (name, exchange, currency). Populated by
+    the Names editor and/or the populate_names.py enrichment script. The app reads
+    names/exchange/currency only from here — it never calls yfinance for them."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT ticker, name FROM ticker_names WHERE name IS NOT NULL AND name <> ''"
+            "SELECT ticker, name, exchange, currency FROM ticker_names"
         ).fetchall()
-    return dict(rows)
+    return {t: (n, e, c) for t, n, e, c in rows}
 
 
 def set_ticker_name(ticker: str, name: str):
-    """Set (or clear, when name is blank) the manual display name for a ticker."""
-    name = (name or "").strip()
+    """Set (or clear, when blank) the manual display name, preserving exchange/currency."""
+    name = (name or "").strip() or None
     with get_conn() as conn:
-        conn.execute("DELETE FROM ticker_names WHERE ticker = ?", [ticker])
-        if name:
+        exists = conn.execute("SELECT 1 FROM ticker_names WHERE ticker = ?", [ticker]).fetchone()
+        if exists:
+            conn.execute("UPDATE ticker_names SET name = ? WHERE ticker = ?", [name, ticker])
+        elif name:
             conn.execute("INSERT INTO ticker_names (ticker, name) VALUES (?, ?)", [ticker, name])
 
 
@@ -390,54 +405,25 @@ def _batch_prices(tickers: tuple[str, ...]) -> dict[str, tuple]:
     return out
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def _ticker_meta(tickers: tuple[str, ...]) -> dict[str, tuple]:
-    """Best-effort company name / exchange / currency via `.info`. These rarely change
-    (hence the long cache), and `.info` is frequently blocked on cloud IPs — so we
-    fail fast: if the first lookup is blocked, skip the rest and fall back to the
-    ticker symbol. Prices come from `_batch_prices` and don't depend on this."""
-    meta: dict[str, tuple] = {}
-    blocked = False
-    for i, ticker in enumerate(tickers):
-        if blocked:
-            meta[ticker] = (ticker, "—", "")
-            continue
-        try:
-            info = yf.Ticker(ticker).info
-            name = info.get("longName") or info.get("shortName")
-            if not name:
-                raise ValueError("no info")
-            meta[ticker] = (
-                name,
-                info.get("fullExchangeName") or info.get("exchange") or "—",
-                info.get("currency") or "",
-            )
-        except Exception:
-            meta[ticker] = (ticker, "—", "")
-            if i == 0:
-                blocked = True  # endpoint looks throttled — stop hammering it
-    return meta
-
-
 @st.cache_data(ttl=300)
 def fetch_quotes(tickers: list[str]) -> pd.DataFrame:
+    """Prices only — in one batched request. Name/exchange/currency are filled in by
+    the caller from the DB (get_ticker_meta); the app no longer calls yfinance for
+    metadata, so it works even where Yahoo's .info endpoint is blocked (cloud)."""
     tickers = list(tickers)
     prices = _batch_prices(tuple(tickers))
-    meta = _ticker_meta(tuple(tickers))
     rows = []
     for ticker in tickers:
         last, prev, asof = prices.get(ticker, (None, None, None))
         change_pct = (last - prev) / prev * 100 if (prev and last) else None
-        name, exchange, currency = meta.get(ticker, (ticker, "—", ""))
-        timestamp = asof.strftime("%Y-%m-%d %H:%M") if asof else "—"
         rows.append({
-            "Name":        name,
+            "Name":        ticker,   # placeholder; overridden from the DB by the caller
             "Ticker":      ticker,
-            "Exchange":    exchange,
+            "Exchange":    "—",
             "Price":       last,
             "Change %":    change_pct,
-            "Currency":    currency,
-            "Last Update": timestamp,
+            "Currency":    "",
+            "Last Update": asof.strftime("%Y-%m-%d %H:%M") if asof else "—",
         })
     return pd.DataFrame(rows)
 
@@ -817,11 +803,17 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
     with st.spinner("Fetching quotes…"):
         df = fetch_quotes(tickers)
 
-    # Manual display names (maintained on the Edit screen) take precedence over the
-    # auto-fetched name, which falls back to the ticker when yfinance is unavailable.
-    manual_names = get_ticker_names()
-    if manual_names:
-        df["Name"] = df.apply(lambda r: manual_names.get(r["Ticker"]) or r["Name"], axis=1)
+    # Name / exchange / currency come from the DB (maintained via the Names tab and the
+    # populate_names.py enrichment script), falling back to the ticker when absent.
+    meta = get_ticker_meta()
+
+    def _meta(t, idx, fallback):
+        v = meta.get(t)
+        return v[idx] if (v and v[idx]) else fallback
+
+    df["Name"]     = df["Ticker"].map(lambda t: _meta(t, 0, t))
+    df["Exchange"] = df["Ticker"].map(lambda t: _meta(t, 1, "—"))
+    df["Currency"] = df["Ticker"].map(lambda t: _meta(t, 2, ""))
 
     st.caption(f"Data as of {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -1167,39 +1159,60 @@ def render_edit_screen(watchlists: dict[str, list[str]]):
                     st.success(f"Removed all tags from {tag_ticker}.")
                     st.rerun()
 
-    # ── Maintain manual display names for tickers ──────────────────────────────
+    # ── Maintain display names (and run the yfinance enrichment) ───────────────
     with tab_names:
         all_tickers = sorted({t for lst in watchlists.values() for t in lst})
         if not all_tickers:
             st.info("No stocks yet. Add some on the ‘Add stock’ tab.")
         else:
             st.caption(
-                "Set a display name per ticker. Manual names override the auto-fetched "
-                "name (useful when yfinance can't be reached, e.g. on Streamlit Cloud). "
-                "Leave blank to fall back to the automatic name."
+                "Names, exchange and currency are read from the database (the app never "
+                "calls yfinance for them). Edit a Name to override it, or use the button "
+                "to fetch missing values from Yahoo. Blank Name falls back to the ticker."
             )
-            names = get_ticker_names()
-            editor_df = pd.DataFrame(
-                {"Ticker": all_tickers, "Name": [names.get(t, "") for t in all_tickers]}
-            )
+
+            if st.button("⬇️ Fetch missing names from Yahoo",
+                         help="Runs yfinance now. Works locally; on Streamlit Cloud "
+                              "Yahoo usually blocks this — run populate_names.py locally instead."):
+                with st.spinner("Fetching from Yahoo…"):
+                    summary = enrich_ticker_meta(get_conn())
+                st.cache_data.clear()
+                st.success(
+                    f"Processed {summary['processed']} ticker(s): "
+                    f"added {summary['added']}, failed {len(summary['failed'])}."
+                )
+                if summary["failed"]:
+                    st.caption("Couldn't fetch: " + ", ".join(summary["failed"]))
+                st.rerun()
+
+            meta = get_ticker_meta()
+            editor_df = pd.DataFrame({
+                "Ticker":   all_tickers,
+                "Name":     [(meta.get(t) or ("", "", ""))[0] or "" for t in all_tickers],
+                "Exchange": [(meta.get(t) or ("", "", ""))[1] or "" for t in all_tickers],
+                "Currency": [(meta.get(t) or ("", "", ""))[2] or "" for t in all_tickers],
+            })
             edited = st.data_editor(
                 editor_df,
                 hide_index=True,
                 use_container_width=True,
-                disabled=["Ticker"],
+                disabled=["Ticker", "Exchange", "Currency"],
                 column_config={
                     "Ticker": st.column_config.TextColumn("Ticker"),
                     "Name": st.column_config.TextColumn(
-                        "Name", help="Manual display name (overrides the auto name)"
+                        "Name", help="Display name (overrides the fetched one)"
                     ),
+                    "Exchange": st.column_config.TextColumn("Exchange", help="Fetched; read-only"),
+                    "Currency": st.column_config.TextColumn("Currency", help="Fetched; read-only"),
                 },
                 key="names_editor",
             )
             if st.button("Save names", type="primary"):
+                current = {t: (meta.get(t) or ("", "", ""))[0] or "" for t in all_tickers}
                 changed = 0
                 for _, r in edited.iterrows():
                     new = (r["Name"] or "").strip()
-                    if new != names.get(r["Ticker"], ""):
+                    if new != current.get(r["Ticker"], ""):
                         set_ticker_name(r["Ticker"], new)
                         changed += 1
                 st.cache_data.clear()
