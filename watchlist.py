@@ -844,9 +844,15 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
             st.session_state[tag_key] = False
             st.session_state[type_key] = False
 
-    c_today, c_status, c_grouptype, c_wlfilter, c_groupwl, c_tags, c_group = st.columns(
-        [2, 2, 2, 2, 2, 2, 2]
-    )
+    # The watchlist filter / grouping only make sense on the aggregate "All" view.
+    is_all = selected_list == ALL_LABEL
+    if is_all:
+        c_today, c_status, c_grouptype, c_wlfilter, c_groupwl, c_tags, c_group = st.columns(
+            [2, 2, 2, 2, 2, 2, 2]
+        )
+    else:
+        c_today, c_status, c_grouptype, c_tags, c_group = st.columns([2, 2, 2, 3, 2])
+
     with c_today:
         only_today = st.toggle("Show only stocks updated today", key=f"only_today::{selected_list}")
     with c_status:
@@ -858,20 +864,24 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
                 placeholder="Filter by type",
                 label_visibility="collapsed",
             )
-            if selected_list == ALL_LABEL else []
+            if is_all else []
         )
     with c_grouptype:
         group_by_type = st.toggle("Group by type", key=type_key, on_change=_excl_type)
-    with c_wlfilter:
-        wl_filter = st.multiselect(
-            "Filter by watchlist",
-            list(watchlists.keys()),
-            key=f"wlfilter::{selected_list}",
-            placeholder="Filter by watchlist",
-            label_visibility="collapsed",
-        )
-    with c_groupwl:
-        group_by_watchlist = st.toggle("Group by watchlist", key=wl_key, on_change=_excl_wl)
+    if is_all:
+        with c_wlfilter:
+            wl_filter = st.multiselect(
+                "Filter by watchlist",
+                list(watchlists.keys()),
+                key=f"wlfilter::{selected_list}",
+                placeholder="Filter by watchlist",
+                label_visibility="collapsed",
+            )
+        with c_groupwl:
+            group_by_watchlist = st.toggle("Group by watchlist", key=wl_key, on_change=_excl_wl)
+    else:
+        wl_filter = []
+        group_by_watchlist = False
     with c_tags:
         tag_filter = st.multiselect(
             "Filter by tags",
