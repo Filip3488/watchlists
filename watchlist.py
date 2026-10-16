@@ -333,40 +333,86 @@ st.markdown(
 )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _batch_prices(tickers: tuple[str, ...]) -> dict[str, tuple]:
+    """Last price, previous close and as-of date for all tickers in ONE yf.download
+    call (the chart endpoint). This replaces ~2 requests per ticker with a single
+    batched request — far more reliable on cloud IPs that Yahoo rate-limits."""
+    out: dict[str, tuple] = {}
+    if not tickers:
+        return out
+    try:
+        data = yf.download(
+            list(tickers), period="5d", interval="1d", group_by="ticker",
+            progress=False, threads=True, auto_adjust=False,
+        )
+    except Exception:
+        return out
+    if data is None or data.empty:
+        return out
+    multi = isinstance(data.columns, pd.MultiIndex)
+    for t in tickers:
+        try:
+            closes = (data[t]["Close"] if multi else data["Close"]).dropna()
+            if closes.empty:
+                continue
+            last = float(closes.iloc[-1])
+            prev = float(closes.iloc[-2]) if len(closes) >= 2 else None
+            out[t] = (last, prev, closes.index[-1].to_pydatetime())
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _ticker_meta(tickers: tuple[str, ...]) -> dict[str, tuple]:
+    """Best-effort company name / exchange / currency via `.info`. These rarely change
+    (hence the long cache), and `.info` is frequently blocked on cloud IPs — so we
+    fail fast: if the first lookup is blocked, skip the rest and fall back to the
+    ticker symbol. Prices come from `_batch_prices` and don't depend on this."""
+    meta: dict[str, tuple] = {}
+    blocked = False
+    for i, ticker in enumerate(tickers):
+        if blocked:
+            meta[ticker] = (ticker, "—", "")
+            continue
+        try:
+            info = yf.Ticker(ticker).info
+            name = info.get("longName") or info.get("shortName")
+            if not name:
+                raise ValueError("no info")
+            meta[ticker] = (
+                name,
+                info.get("fullExchangeName") or info.get("exchange") or "—",
+                info.get("currency") or "",
+            )
+        except Exception:
+            meta[ticker] = (ticker, "—", "")
+            if i == 0:
+                blocked = True  # endpoint looks throttled — stop hammering it
+    return meta
+
+
 @st.cache_data(ttl=300)
 def fetch_quotes(tickers: list[str]) -> pd.DataFrame:
+    tickers = list(tickers)
+    prices = _batch_prices(tuple(tickers))
+    meta = _ticker_meta(tuple(tickers))
     rows = []
     for ticker in tickers:
-        try:
-            t = yf.Ticker(ticker)
-            fast = t.fast_info
-            info = t.info
-
-            prev_close = fast.previous_close
-            last_price = fast.last_price
-            change_pct = (last_price - prev_close) / prev_close * 100 if prev_close and last_price else None
-            currency   = fast.currency or ""
-
-            name     = info.get("longName") or info.get("shortName") or ticker
-            exchange = info.get("fullExchangeName") or info.get("exchange") or "—"
-
-            reg_time = info.get("regularMarketTime")
-            timestamp = datetime.fromtimestamp(reg_time).strftime("%Y-%m-%d %H:%M") if reg_time else "—"
-
-            rows.append({
-                "Name":       name,
-                "Ticker":     ticker,
-                "Exchange":   exchange,
-                "Price":      last_price,
-                "Change %":   change_pct,
-                "Currency":   currency,
-                "Last Update":timestamp,
-            })
-        except Exception:
-            rows.append({
-                "Name": ticker, "Ticker": ticker, "Exchange": "—",
-                "Price": None,  "Change %": None, "Currency": "", "Last Update": "—",
-            })
+        last, prev, asof = prices.get(ticker, (None, None, None))
+        change_pct = (last - prev) / prev * 100 if (prev and last) else None
+        name, exchange, currency = meta.get(ticker, (ticker, "—", ""))
+        timestamp = asof.strftime("%Y-%m-%d %H:%M") if asof else "—"
+        rows.append({
+            "Name":        name,
+            "Ticker":      ticker,
+            "Exchange":    exchange,
+            "Price":       last,
+            "Change %":    change_pct,
+            "Currency":    currency,
+            "Last Update": timestamp,
+        })
     return pd.DataFrame(rows)
 
 
