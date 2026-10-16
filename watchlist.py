@@ -1,0 +1,1190 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import duckdb
+import os
+import re
+import html
+from pathlib import Path
+from datetime import datetime, timedelta
+
+st.set_page_config(page_title="Stock Monitor", layout="wide")
+
+
+def _load_env(path: Path):
+    """Minimal .env loader (no extra dependency). Real environment variables win."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_env(Path(__file__).parent / ".env")
+
+
+def _secret(name: str, default: str | None = None) -> str | None:
+    """Resolve a secret from, in order: Streamlit secrets (the Streamlit Cloud
+    dashboard or a local .streamlit/secrets.toml), then environment variables / the
+    local .env file. This lets the same code run locally and on Streamlit Cloud."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass  # no secrets.toml present (e.g. a plain local run) — fall through to env
+    return os.environ.get(name, default)
+
+
+DB_NAME = _secret("DB_NAME", "watchlists")
+
+DEFAULT_WATCHLISTS = {
+    "US Tech":      ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "ORCL"],
+    "US Finance":   ["JPM", "BAC", "GS", "MS", "WFC", "C", "BLK", "AXP", "V", "MA"],
+    "EU Blue Chips":["SAP.DE", "ASML.AS", "LVMH.PA", "MC.PA", "SIE.DE", "ALV.DE", "BAS.DE", "BMW.DE", "DTE.DE", "ADS.DE"],
+    "Crypto":       ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "AVAX-USD", "DOT-USD", "MATIC-USD"],
+}
+
+TAGS = ["Sell", "Stock up", "Monitor"]
+
+
+# ── Database (MotherDuck) ───────────────────────────────────────────────────────
+@st.cache_resource
+def _db() -> duckdb.DuckDBPyConnection:
+    """One cached MotherDuck connection for the whole app (auth/handshake once)."""
+    token = _secret("MOTHERDUCK_TOKEN")
+    if not token:
+        st.error(
+            "MOTHERDUCK_TOKEN is not set — add it to EmbeddedTradingView/.env locally, "
+            "or to the app's Secrets on Streamlit Cloud."
+        )
+        st.stop()
+    os.environ["motherduck_token"] = token  # read by the MotherDuck extension
+    return duckdb.connect(f"md:{DB_NAME}")
+
+
+def get_conn() -> duckdb.DuckDBPyConnection:
+    # A short-lived cursor over the one cached MotherDuck connection. Each caller gets
+    # its own cursor, so existing `with get_conn() as conn:` sites keep working — the
+    # `with` closes the cursor, not the shared connection — and no new network
+    # connection is opened per call.
+    return _db().cursor()
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_watchlists START 1")
+        conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_items START 1")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watchlists (
+                id     INTEGER PRIMARY KEY DEFAULT nextval('seq_watchlists'),
+                name   TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL DEFAULT 'target'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS items (
+                id           INTEGER PRIMARY KEY DEFAULT nextval('seq_items'),
+                watchlist_id INTEGER NOT NULL,
+                ticker       TEXT NOT NULL,
+                UNIQUE(watchlist_id, ticker)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_tags (
+                ticker TEXT NOT NULL,
+                tag    TEXT NOT NULL,
+                UNIQUE(ticker, tag)
+            )
+            """
+        )
+        # Migrate older DBs that predate the watchlist status column
+        cols = [r[1] for r in conn.execute("PRAGMA table_info('watchlists')").fetchall()]
+        if "status" not in cols:
+            conn.execute("ALTER TABLE watchlists ADD COLUMN status TEXT NOT NULL DEFAULT 'target'")
+        if "position" not in cols:
+            conn.execute("ALTER TABLE watchlists ADD COLUMN position INTEGER")
+            conn.execute("UPDATE watchlists SET position = id WHERE position IS NULL")
+
+        # Seed defaults only if the DB is empty
+        empty = conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0] == 0
+        if empty:
+            for pos, (name, tickers) in enumerate(DEFAULT_WATCHLISTS.items()):
+                wl_id = conn.execute(
+                    "INSERT INTO watchlists (name, status, position) VALUES (?, 'target', ?) RETURNING id",
+                    [name, pos],
+                ).fetchone()[0]
+                conn.executemany(
+                    "INSERT INTO items (watchlist_id, ticker) VALUES (?, ?)",
+                    [(wl_id, t) for t in tickers],
+                )
+
+
+def get_watchlists() -> dict[str, list[str]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT w.name, i.ticker
+            FROM watchlists w
+            LEFT JOIN items i ON i.watchlist_id = w.id
+            ORDER BY COALESCE(w.position, w.id), w.id, i.id
+            """
+        ).fetchall()
+    result: dict[str, list[str]] = {}
+    for name, ticker in rows:
+        result.setdefault(name, [])
+        if ticker is not None:
+            result[name].append(ticker)
+    return result
+
+
+def create_watchlist(name: str, status: str = "target") -> bool:
+    try:
+        with get_conn() as conn:
+            next_pos = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM watchlists"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO watchlists (name, status, position) VALUES (?, ?, ?)",
+                [name, status, next_pos],
+            )
+        return True
+    except duckdb.ConstraintException:
+        return False
+
+
+def set_watchlist_order(names_in_order: list[str]):
+    with get_conn() as conn:
+        for pos, name in enumerate(names_in_order):
+            conn.execute("UPDATE watchlists SET position = ? WHERE name = ?", [pos, name])
+
+
+def get_watchlist_statuses() -> dict[str, str]:
+    with get_conn() as conn:
+        return dict(conn.execute("SELECT name, status FROM watchlists").fetchall())
+
+
+def set_watchlist_status(name: str, status: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE watchlists SET status = ? WHERE name = ?", [status, name])
+
+
+def add_item(watchlist_name: str, ticker: str) -> bool:
+    try:
+        with get_conn() as conn:
+            wl = conn.execute(
+                "SELECT id FROM watchlists WHERE name = ?", [watchlist_name]
+            ).fetchone()
+            if wl is None:
+                return False
+            conn.execute(
+                "INSERT INTO items (watchlist_id, ticker) VALUES (?, ?)", [wl[0], ticker]
+            )
+        return True
+    except duckdb.ConstraintException:
+        return False
+
+
+def delete_watchlist(name: str):
+    # DuckDB has no ON DELETE CASCADE, so remove child rows first
+    with get_conn() as conn:
+        wl = conn.execute("SELECT id FROM watchlists WHERE name = ?", [name]).fetchone()
+        if wl is not None:
+            conn.execute("DELETE FROM items WHERE watchlist_id = ?", [wl[0]])
+            conn.execute("DELETE FROM watchlists WHERE id = ?", [wl[0]])
+
+
+def rename_watchlist(old_name: str, new_name: str) -> bool:
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE watchlists SET name = ? WHERE name = ?", [new_name, old_name]
+            )
+        return True
+    except duckdb.ConstraintException:
+        return False
+
+
+def delete_item(watchlist_name: str, ticker: str):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            DELETE FROM items
+            WHERE ticker = ?
+              AND watchlist_id = (SELECT id FROM watchlists WHERE name = ?)
+            """,
+            [ticker, watchlist_name],
+        )
+
+
+def get_tags_map() -> dict[str, list[str]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT ticker, tag FROM stock_tags ORDER BY ticker, tag").fetchall()
+    result: dict[str, list[str]] = {}
+    for ticker, tag in rows:
+        result.setdefault(ticker, []).append(tag)
+    return result
+
+
+def get_tags(ticker: str) -> list[str]:
+    with get_conn() as conn:
+        return [
+            r[0]
+            for r in conn.execute(
+                "SELECT tag FROM stock_tags WHERE ticker = ? ORDER BY tag", [ticker]
+            ).fetchall()
+        ]
+
+
+def set_tags(ticker: str, tags: list[str]):
+    """Replace the full set of tags for a ticker."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM stock_tags WHERE ticker = ?", [ticker])
+        if tags:
+            conn.executemany(
+                "INSERT INTO stock_tags (ticker, tag) VALUES (?, ?)",
+                [(ticker, tg) for tg in tags],
+            )
+
+
+def get_all_tags() -> list[str]:
+    """All known tags: the predefined set plus any user-created ones in the DB."""
+    with get_conn() as conn:
+        used = [r[0] for r in conn.execute("SELECT DISTINCT tag FROM stock_tags").fetchall()]
+    return sorted(set(TAGS) | set(used))
+
+
+init_db()
+
+# ── Global light theme overrides ─────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+    /* Page background */
+    [data-testid="stAppViewContainer"] { background: #f0f4f9; }
+    [data-testid="stHeader"]           { background: #f0f4f9; }
+    /* Sidebar */
+    [data-testid="stSidebar"]          { background: #e4ecf5; }
+    /* General text */
+    html, body, [class*="css"]         { color: #1a1a2e; }
+    /* Responsive winners/losers: desktop cards vs mobile popovers */
+    .tv-desktop { display: block; }
+    [class*="st-key-tvmob-"] { display: none; }
+    /* Responsive big table: desktop (all columns) vs mobile (reduced + detail toggle) */
+    [class*="st-key-tblmob-"] { display: none; }
+    [class*="st-key-tbldetail"] { display: none; }
+    @media (max-width: 640px) {
+        .tv-desktop { display: none !important; }
+        [class*="st-key-tvmob-"] { display: block !important; }
+        [class*="st-key-tbldesk-"] { display: none !important; }
+        [class*="st-key-tblmob-"] { display: block !important; }
+        [class*="st-key-tbldetail"] { display: block !important; }
+        /* Tighter stacking between columns (e.g. losers/winners boxes) on phones */
+        [data-testid="stHorizontalBlock"] { gap: 0.2rem !important; }
+    }
+    /* Text / number inputs: white background for contrast */
+    [data-testid="stTextInput"] input,
+    [data-testid="stNumberInput"] input {
+        background-color: #ffffff !important;
+        border: 1px solid #c3cfdd !important;
+        color: #1a1a2e !important;
+    }
+    /* Selectbox & multiselect closed control → white (target BaseWeb directly) */
+    div[data-baseweb="select"] > div {
+        background-color: #ffffff !important;
+        border: 1px solid #c3cfdd !important;
+        color: #1a1a2e !important;
+    }
+    div[data-baseweb="select"] input {
+        background-color: #ffffff !important;
+    }
+    /* Selectbox open dropdown menu + options */
+    div[data-baseweb="popover"] div[data-baseweb="menu"],
+    div[data-baseweb="popover"] ul[role="listbox"] {
+        background-color: #ffffff !important;
+    }
+    div[data-baseweb="popover"] li[role="option"] {
+        background-color: #ffffff !important;
+        color: #1a1a2e !important;
+    }
+    div[data-baseweb="popover"] li[role="option"]:hover {
+        background-color: #e8f0fb !important;
+    }
+    /* Sidebar buttons styled as left-aligned menu items */
+    [data-testid="stSidebar"] .stButton button {
+        justify-content: flex-start;
+        text-align: left;
+        border: none;
+        box-shadow: none;
+    }
+    /* Nudge the news filter down so its top edge aligns with the table's top edge
+       (the dataframe starts slightly lower than the top of its column). */
+    [class*="st-key-news_pick"] { margin-top: 1.3rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+@st.cache_data(ttl=300)
+def fetch_quotes(tickers: list[str]) -> pd.DataFrame:
+    rows = []
+    for ticker in tickers:
+        try:
+            t = yf.Ticker(ticker)
+            fast = t.fast_info
+            info = t.info
+
+            prev_close = fast.previous_close
+            last_price = fast.last_price
+            change_pct = (last_price - prev_close) / prev_close * 100 if prev_close and last_price else None
+            currency   = fast.currency or ""
+
+            name     = info.get("longName") or info.get("shortName") or ticker
+            exchange = info.get("fullExchangeName") or info.get("exchange") or "—"
+
+            reg_time = info.get("regularMarketTime")
+            timestamp = datetime.fromtimestamp(reg_time).strftime("%Y-%m-%d %H:%M") if reg_time else "—"
+
+            rows.append({
+                "Name":       name,
+                "Ticker":     ticker,
+                "Exchange":   exchange,
+                "Price":      last_price,
+                "Change %":   change_pct,
+                "Currency":   currency,
+                "Last Update":timestamp,
+            })
+        except Exception:
+            rows.append({
+                "Name": ticker, "Ticker": ticker, "Exchange": "—",
+                "Price": None,  "Change %": None, "Currency": "", "Last Update": "—",
+            })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_news(entries: tuple[tuple[str, str], ...], per_ticker: int = 8, limit: int | None = None) -> list[dict]:
+    """Fetch recent Yahoo Finance news for a set of stocks, de-duplicated and tagged.
+
+    `entries` is a tuple of (ticker, company name) pairs. Yahoo's Search returns no
+    news for exchange-suffixed international tickers (e.g. SAP.DE), so we query the
+    ticker first (precise, works for US symbols and crypto) and fall back to the
+    cleaned company name when that is empty. Results are keyed by Yahoo's `uuid`, so
+    an article relating to several watchlist stocks appears once, tagged with all of
+    them (the intersection of its tickers with the watchlist)."""
+    watch = {t for t, _ in entries}
+    by_uuid: dict[str, dict] = {}
+    for ticker, name in entries:
+        items = _search_news(ticker, per_ticker)
+        if not items and name:
+            items = _search_news(_news_query(name), per_ticker)
+        for it in items:
+            uid = it.get("uuid") or it.get("link")
+            if not uid:
+                continue
+            rec = by_uuid.setdefault(uid, {
+                "title": it.get("title", ""), "link": it.get("link", ""),
+                "publisher": it.get("publisher", ""),
+                "time": it.get("providerPublishTime", 0) or 0, "tickers": set(),
+            })
+            rec["tickers"].add(ticker)                   # surfaced via this stock's query
+            for rt in (it.get("relatedTickers") or []):  # plus any related watchlist tickers
+                if rt in watch:
+                    rec["tickers"].add(rt)
+    out = sorted(by_uuid.values(), key=lambda r: r["time"], reverse=True)
+    # Keep only articles from today and yesterday (from the start of yesterday onward).
+    cutoff = (datetime.now() - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).timestamp()
+    out = [r for r in out if r["time"] >= cutoff]
+    for r in out:
+        r["tickers"] = sorted(r["tickers"])  # set -> list (picklable for cache)
+    return out if limit is None else out[:limit]
+
+
+# Corporate-form / currency tokens stripped before a company-name news search
+_DROP_TOKENS = {
+    "INC", "INC.", "CORP", "CORP.", "CORPORATION", "CO", "CO.", "COMPANY", "LTD",
+    "LTD.", "LIMITED", "PLC", "AG", "SE", "NV", "N.V.", "SA", "S.A.", "A/S", "AB",
+    "SPA", "S.P.A.", "HOLDING", "HOLDINGS", "GROUP", "KGAA", "USD", "(PUBL)", "PUBL", "THE",
+}
+
+
+def _news_query(name: str) -> str:
+    """Turn a long company name into a search-friendly query by dropping legal-form
+    and currency tokens (e.g. 'Novo Nordisk A/S' -> 'Novo Nordisk', 'Ethereum USD' -> 'Ethereum')."""
+    kept = [w for w in name.replace(",", " ").split() if w.upper() not in _DROP_TOKENS]
+    return " ".join(kept).strip() or name
+
+
+def _search_news(query: str, count: int) -> list[dict]:
+    try:
+        return yf.Search(query, news_count=count).news or []
+    except Exception:
+        return []
+
+
+def validate_ticker(ticker: str) -> dict:
+    """Look up a ticker on Yahoo and return its metadata plus a freshness check."""
+    try:
+        t = yf.Ticker(ticker)
+        fast = t.fast_info
+        info = t.info
+
+        last_price = fast.last_price
+        if not last_price:
+            return {"ok": False, "error": "No price data found for this symbol."}
+
+        name     = info.get("longName") or info.get("shortName")
+        exchange = info.get("fullExchangeName") or info.get("exchange")
+        currency = fast.currency or info.get("currency") or ""
+
+        reg_time = info.get("regularMarketTime")
+        if reg_time:
+            last_update = datetime.fromtimestamp(reg_time)
+            age_days = (datetime.now() - last_update).days
+            fresh = age_days <= 5          # updated within the last ~trading week
+            ts_str = last_update.strftime("%Y-%m-%d %H:%M")
+        else:
+            fresh, ts_str = False, "—"
+
+        return {
+            "ok": True,
+            "ticker": ticker,
+            "name": name or "(name unavailable)",
+            "exchange": exchange or "(exchange unavailable)",
+            "price": last_price,
+            "currency": currency,
+            "last_update": ts_str,
+            "fresh": fresh,
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"Lookup failed: {e}"}
+
+
+def fmt_pct(val):
+    if val is None or pd.isna(val):
+        return "—"
+    sign = "+" if val >= 0 else ""
+    return f"{sign}{val:.2f}%"
+
+def fmt_price(val):
+    if val is None or pd.isna(val):
+        return "—"
+    return f"{val:,.2f}"
+
+
+def is_stale(last_update) -> bool:
+    """True if the quote's Last Update is not from today (or missing)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return not (isinstance(last_update, str) and last_update.startswith(today))
+
+
+STALE_BG = "#e6e9ee"   # light grey for not-updated-today rows
+
+# Yahoo ticker suffix → TradingView exchange prefix
+TV_EXCHANGE_BY_SUFFIX = {
+    "DE": "XETR", "F": "FWB", "AS": "EURONEXT", "PA": "EURONEXT", "BR": "EURONEXT",
+    "LS": "EURONEXT", "L": "LSE", "CO": "OMXCOP", "HE": "OMXHEX", "ST": "OMXSTO",
+    "OL": "OSL", "MI": "MIL", "MC": "BME", "SW": "SIX", "VI": "VIE",
+    "HK": "HKEX", "T": "TSE", "TO": "TSX", "V": "TSXV", "AX": "ASX", "NZ": "NZX",
+    "SI": "SGX", "KS": "KRX", "TW": "TWSE", "SS": "SSE", "SZ": "SZSE", "BO": "BSE", "NS": "NSE",
+}
+# US exchange name (from Yahoo) → TradingView exchange prefix
+TV_EXCHANGE_US = {
+    "NasdaqGS": "NASDAQ", "NasdaqGM": "NASDAQ", "NasdaqCM": "NASDAQ",
+    "NYSE": "NYSE", "NYSEArca": "AMEX", "NYSE American": "AMEX", "NYSEAmerican": "AMEX",
+}
+
+
+def tradingview_url(ticker: str, exchange: str) -> str:
+    """Best-effort TradingView chart URL for a Yahoo ticker."""
+    t = (ticker or "").upper()
+    if not t:
+        return ""
+    base_url = "https://www.tradingview.com/chart/?symbol="
+    if t.endswith("-USD"):                       # crypto, e.g. BTC-USD → BTCUSD
+        return base_url + t.replace("-", "")
+    if "." in t:                                 # international, e.g. SAP.DE
+        base, suffix = t.rsplit(".", 1)
+        base = base.replace("-", "_")            # TV uses underscores for share classes
+        prefix = TV_EXCHANGE_BY_SUFFIX.get(suffix)
+        return base_url + (f"{prefix}:{base}" if prefix else base)
+    prefix = TV_EXCHANGE_US.get(exchange)        # US / no suffix
+    return base_url + (f"{prefix}:{t}" if prefix else t)
+
+
+def top5_panel(df: pd.DataFrame, title: str, ascending: bool):
+    subset = df.dropna(subset=["Change %"]).sort_values("Change %", ascending=ascending).head(5)
+    accent = "#d9534f" if ascending else "#28a745"   # red losers / green winners
+    bg_card = "#fff5f5" if ascending else "#f3faf4"
+    key = "losers" if ascending else "winners"
+
+    # ── Desktop view: rich inline cards (hidden on small screens via CSS) ───────
+    rows_html = ""
+    for _, row in subset.iterrows():
+        pct = row["Change %"]
+        up = pct >= 0
+        row_accent = "#28a745" if up else "#d9534f"
+        arrow = "▲" if up else "▼"
+        row_bg = STALE_BG if is_stale(row.get("Last Update")) else "#ffffff"
+        tv_url = tradingview_url(row["Ticker"], row.get("Exchange", ""))
+        rows_html += f"""
+        <div style="display:flex; justify-content:space-between; align-items:center;
+                    padding:7px 12px; margin-bottom:5px;
+                    background:{row_bg}; border-radius:8px;
+                    border-left:4px solid {row_accent};
+                    box-shadow:0 1px 3px rgba(0,0,0,.06)">
+            <a href="{tv_url}" target="_blank" title="Open chart on TradingView"
+               style="font-weight:700; color:#1a1a2e; min-width:70px; text-decoration:none">{row['Ticker']} ↗</a>
+            <span style="color:#666; font-size:.86em; flex:1.4; padding:0 10px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis">{row.get('Name', '')}</span>
+            <span style="color:#888; font-size:.78em; flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis">{row.get('Exchange', '')}</span>
+            <span style="color:#444; font-size:.9em; white-space:nowrap; min-width:95px; text-align:right">{fmt_price(row['Price'])} {row['Currency']}</span>
+            <span style="color:{row_accent}; font-weight:700; min-width:70px; text-align:right">{arrow} {fmt_pct(pct)}</span>
+            <span style="color:#999; font-size:.74em; white-space:nowrap; min-width:95px; text-align:right">{row.get('Last Update', '')}</span>
+        </div>"""
+
+    st.markdown(
+        f"""
+        <div class="tv-desktop" style="background:{bg_card}; border:1.5px solid {accent};
+                    border-radius:14px; padding:16px 18px; box-shadow:0 2px 8px rgba(0,0,0,.08)">
+            <div style="font-size:1.05em; font-weight:700; color:{accent}; margin-bottom:10px">{title}</div>
+            {rows_html if rows_html else '<div style="color:#888">No data.</div>'}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Mobile view: compact rows + tap-to-expand popovers (hidden on desktop) ──
+    with st.container(key=f"tvmob-{key}", border=True):
+        st.markdown(
+            f"<div style='font-size:1.05em; font-weight:700; color:{accent}; "
+            f"margin-bottom:22px'>{title}</div>",
+            unsafe_allow_html=True,
+        )
+        if subset.empty:
+            st.caption("No data.")
+        for _, row in subset.iterrows():
+            pct = row["Change %"]
+            up = pct >= 0
+            dot = "🟢" if up else "🔴"
+            arrow = "▲" if up else "▼"
+            color = "#28a745" if up else "#d9534f"
+            label = f"{dot}  {row['Ticker']}   {arrow} {fmt_pct(pct)}"
+            with st.popover(label, use_container_width=True):
+                st.markdown(f"### {row['Ticker']}")
+                st.markdown(f"**{row.get('Name', '')}**")
+                st.markdown(
+                    f"- **Exchange:** {row.get('Exchange', '—')}\n"
+                    f"- **Price:** {fmt_price(row['Price'])} {row['Currency']}\n"
+                    f"- **Change:** <span style='color:{color}; font-weight:700'>"
+                    f"{arrow} {fmt_pct(pct)}</span>\n"
+                    f"- **Last update:** {row.get('Last Update', '—')}",
+                    unsafe_allow_html=True,
+                )
+                st.link_button(
+                    "Open chart on TradingView ↗",
+                    tradingview_url(row["Ticker"], row.get("Exchange", "")),
+                    use_container_width=True,
+                )
+
+
+def news_panel(items: list[dict], max_height: int | None = None):
+    """Render a bordered news card: each article links out and is tagged with the
+    watchlist ticker(s) it relates to. `max_height` caps the box (with internal
+    scroll) so it never runs longer than the table beside it."""
+    rows_html = ""
+    for it in items:
+        title = html.escape(it.get("title", "") or "(untitled)")
+        link = html.escape(it.get("link", "") or "#", quote=True)
+        publisher = html.escape(it.get("publisher", "") or "")
+        ts = it.get("time", 0)
+        when = datetime.fromtimestamp(ts).strftime("%b %d, %H:%M") if ts else ""
+        meta = " · ".join(p for p in (publisher, when) if p)
+        chips = "".join(
+            f"""<span style="display:inline-block; background:#e8f0fb; color:#1a4a7a;
+                 font-size:.72em; font-weight:700; padding:1px 7px; margin:2px 4px 0 0;
+                 border-radius:10px">{html.escape(t)}</span>"""
+            for t in it.get("tickers", [])
+        )
+        rows_html += f"""
+        <div style="padding:9px 2px; border-bottom:1px solid #e3e9f0">
+            <a href="{link}" target="_blank" rel="noopener"
+               style="font-weight:600; color:#1a1a2e; text-decoration:none;
+                      font-size:.9em; line-height:1.3">{title}</a>
+            <div style="color:#888; font-size:.74em; margin-top:3px">{meta}</div>
+            <div style="margin-top:2px">{chips}</div>
+        </div>"""
+
+    cap = f"max-height:{max_height}px; overflow-y:auto;" if max_height else ""
+    st.markdown(
+        f"""
+        <div style="background:#ffffff; border:1.5px solid #c3cfdd; border-radius:14px;
+                    padding:14px 16px; {cap}
+                    box-shadow:0 2px 8px rgba(0,0,0,.08)">
+            <div style="font-size:1.05em; font-weight:700; color:#1a1a2e;
+                        margin-bottom:6px">📰 News{f" ({len(items)})" if items else ""}</div>
+            {rows_html if rows_html else '<div style="color:#888; padding:8px 0">No recent news.</div>'}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ── Screens ───────────────────────────────────────────────────────────────────
+STATUS_LABELS = {"active": "🟢 Held", "target": "🎯 Target", "info": "ℹ️ Info"}
+STATUS_COLORS = {"active": "#28a745", "target": "#4a90d9", "info": "#6c757d"}
+STATUS_ICONS = {"active": "🟢", "target": "🎯", "info": "ℹ️"}
+STATUS_OPTIONS = ["target", "active", "info"]
+
+
+def render_quote_table(frame: pd.DataFrame, tags_map: dict[str, list[str]],
+                       type_map: dict[str, list[str]], detail: bool, key_suffix: str):
+    """Render a quote table. Desktop shows all columns; mobile shows Name + Change %
+    (or all columns when `detail` is on). The two are shown/hidden via CSS."""
+    display = frame.copy()
+    display["Price"] = display.apply(
+        lambda r: f"{fmt_price(r['Price'])} {r['Currency']}".strip() if r["Price"] else "—", axis=1
+    )
+    display["Type"] = display["Ticker"].map(
+        lambda t: " ".join(
+            STATUS_ICONS[s] for s in sorted(type_map.get(t, []), key=STATUS_OPTIONS.index)
+        )
+    )
+    display["Tags"] = display["Ticker"].map(lambda t: tags_map.get(t, []))
+    # Make the ticker itself the clickable link. The cell value is a TradingView URL;
+    # we append the real Yahoo ticker as a harmless query param so the LinkColumn's
+    # regex display_text can show it as the label (e.g. "AAPL", "SAP.DE"). Computed
+    # last, after Type/Tags have read the plain ticker above.
+    display["Ticker"] = display.apply(
+        lambda r: f"{tradingview_url(r['Ticker'], r['Exchange'])}&yfsym={r['Ticker']}", axis=1
+    )
+    display = display[["Name", "Ticker", "Exchange", "Price", "Change %", "Type", "Tags", "Last Update"]]
+    display = display.sort_values("Change %", ascending=True, na_position="last")
+
+    full_cols = ["Name", "Ticker", "Exchange", "Price", "Change %", "Type", "Tags", "Last Update"]
+    full_cfg = {
+        "Ticker": st.column_config.LinkColumn(
+            "Ticker", display_text=r"yfsym=(.+)$", help="Open chart on TradingView ↗"
+        ),
+        "Type": st.column_config.TextColumn("Type", help="Watchlist type(s) this stock belongs to"),
+        "Tags": st.column_config.ListColumn("Tags", help="Assigned tags"),
+    }
+
+    def _pct_color(v):
+        if pd.isna(v):
+            return ""
+        return f"color: {'#28a745' if v >= 0 else '#d9534f'}; font-weight: bold"
+
+    def _stale_row(row):
+        # Look up freshness from the full frame by index so it works for any column subset
+        bg = f"background-color: {STALE_BG}" if is_stale(display.loc[row.name, "Last Update"]) else ""
+        return [bg] * len(row)
+
+    def _make_styled(cols):
+        d = display[cols]
+        right = [c for c in ("Price", "Change %") if c in cols]
+        return (
+            d.style
+            .apply(_stale_row, axis=1)
+            .format({"Change %": lambda v: "—" if pd.isna(v) else f"{'+' if v >= 0 else ''}{v:.2f}%"})
+            .map(_pct_color, subset=["Change %"])
+            .set_properties(**{"text-align": "right"}, subset=right)
+            .hide(axis="index")
+        )
+
+    rows = min(len(display), 50)
+    height = (rows + 1) * 35 + 3
+
+    # Desktop: all columns (hidden on mobile via CSS)
+    with st.container(key=f"tbldesk-{key_suffix}"):
+        st.dataframe(_make_styled(full_cols), use_container_width=True, height=height,
+                     hide_index=True, column_config=full_cfg)
+
+    # Mobile: Name + Change % only, or all columns when detail is on (hidden on desktop)
+    with st.container(key=f"tblmob-{key_suffix}"):
+        if detail:
+            st.dataframe(_make_styled(full_cols), use_container_width=True, height=height,
+                         hide_index=True, column_config=full_cfg)
+        else:
+            st.dataframe(_make_styled(["Name", "Change %"]), use_container_width=True,
+                         height=height, hide_index=True)
+
+
+def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
+    if selected_list == ALL_LABEL:
+        seen = set()
+        tickers = [t for lst in watchlists.values() for t in lst if not (t in seen or seen.add(t))]
+    else:
+        tickers = watchlists.get(selected_list, [])
+
+    st.title(selected_list)
+
+    # Watchlist-level status badge (not shown for the aggregate "All" view)
+    if selected_list != ALL_LABEL:
+        status = get_watchlist_statuses().get(selected_list, "target")
+        st.markdown(
+            f"""<span style="display:inline-block; background:{STATUS_COLORS[status]};
+                color:#fff; font-size:.82em; font-weight:700; padding:2px 10px;
+                border-radius:12px">{STATUS_LABELS[status]}</span>""",
+            unsafe_allow_html=True,
+        )
+
+    if not tickers:
+        st.info("This watchlist is empty. Add stocks on the Edit watchlists screen.")
+        return
+
+    with st.spinner("Fetching quotes…"):
+        df = fetch_quotes(tickers)
+
+    st.caption(f"Data as of {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Per-list default control states (applied once; the user can still change them)
+    st.session_state.setdefault(f"only_today::{selected_list}", selected_list == ALL_LABEL)
+    st.session_state.setdefault(f"groupby::{selected_list}", selected_list == "Indices")
+    if selected_list == ALL_LABEL:
+        st.session_state.setdefault("list_status_filter", ["🎯 Target", "🟢 Held"])
+
+    # The two groupings are mutually exclusive — turning one on turns the other off
+    tag_key = f"groupby::{selected_list}"
+    type_key = f"grouptype::{selected_list}"
+
+    def _excl_tag():
+        if st.session_state.get(tag_key):
+            st.session_state[type_key] = False
+
+    def _excl_type():
+        if st.session_state.get(type_key):
+            st.session_state[tag_key] = False
+
+    c_today, c_status, c_grouptype, c_tags, c_group = st.columns([2, 2, 2, 3, 2])
+    with c_today:
+        only_today = st.toggle("Show only stocks updated today", key=f"only_today::{selected_list}")
+    with c_status:
+        status_filter = (
+            st.multiselect(
+                "Filter by type",
+                ["🎯 Target", "🟢 Held", "ℹ️ Info"],
+                key="list_status_filter",
+                placeholder="Filter by type",
+                label_visibility="collapsed",
+            )
+            if selected_list == ALL_LABEL else []
+        )
+    with c_grouptype:
+        group_by_type = st.toggle("Group by type", key=type_key, on_change=_excl_type)
+    with c_tags:
+        tag_filter = st.multiselect(
+            "Filter by tags",
+            get_all_tags(),
+            key=f"tagfilter::{selected_list}",
+            placeholder="Filter by tags",
+            label_visibility="collapsed",
+        )
+    with c_group:
+        group_by_tag = st.toggle("Group by tag", key=tag_key, on_change=_excl_tag)
+
+    tags_map = get_tags_map()
+
+    # ticker → the status(es) of the watchlist(s) it belongs to (for the Type column)
+    all_statuses = get_watchlist_statuses()
+    type_map: dict[str, list[str]] = {}
+    for name, lst in watchlists.items():
+        s = all_statuses.get(name, "target")
+        for t in lst:
+            type_map.setdefault(t, [])
+            if s not in type_map[t]:
+                type_map[t].append(s)
+
+    if only_today:
+        df = df[~df["Last Update"].apply(is_stale)].reset_index(drop=True)
+
+    if selected_list == ALL_LABEL and status_filter:
+        label_to_status = {"🟢 Held": "active", "🎯 Target": "target", "ℹ️ Info": "info"}
+        wanted = {label_to_status[s] for s in status_filter}
+        statuses = get_watchlist_statuses()
+        allowed = {
+            t for name, lst in watchlists.items()
+            if statuses.get(name, "target") in wanted for t in lst
+        }
+        df = df[df["Ticker"].isin(allowed)].reset_index(drop=True)
+
+    if tag_filter:
+        wanted_tags = set(tag_filter)
+        df = df[df["Ticker"].map(lambda t: bool(set(tags_map.get(t, [])) & wanted_tags))].reset_index(drop=True)
+
+    if df.empty:
+        st.info("No stocks match the current filters.")
+        return
+
+    col_losers, col_winners = st.columns(2, gap="large")
+    with col_losers:
+        top5_panel(df, "Top 5 Losers", ascending=True)
+    with col_winners:
+        top5_panel(df, "Top 5 Winners", ascending=False)
+
+    st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
+
+    def _safe(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "-", str(s)).strip("-") or "x"
+
+    # Table on the left, Yahoo Finance news on the right. On phones the columns
+    # stack, so the news box drops underneath the table (col_table comes first).
+    # The table column is rendered first and the news is fetched inside the news
+    # column, so the table shows immediately while the news is still loading. The
+    # column layout is fixed up front, so this doesn't disturb the alignment.
+    news_entries = tuple(sorted(zip(df["Ticker"], df["Name"])))
+    col_table, col_news = st.columns([2, 1], gap="medium")
+
+    with col_table:
+        # Mobile-only toggle to expand the reduced phone table to all columns
+        # (hidden on desktop via CSS, so it does not offset the table there).
+        with st.container(key="tbldetail"):
+            detail = st.toggle("Show all columns", key=f"tbldetail::{selected_list}")
+
+        if group_by_type:
+            # One table per watchlist type present in the view
+            for status in STATUS_OPTIONS:
+                subset = df[df["Ticker"].map(lambda t: status in type_map.get(t, []))]
+                if subset.empty:
+                    continue
+                st.subheader(f"{STATUS_LABELS[status]}  ·  {len(subset)}")
+                render_quote_table(subset, tags_map, type_map, detail, f"{_safe(selected_list)}-type-{status}")
+        elif group_by_tag:
+            # One table per tag. Which tags: the active filter, else every tag present.
+            if tag_filter:
+                group_tags = list(tag_filter)
+            else:
+                present = set()
+                for t in df["Ticker"]:
+                    present.update(tags_map.get(t, []))
+                group_tags = sorted(present)
+
+            for tag in group_tags:
+                subset = df[df["Ticker"].map(lambda t: tag in tags_map.get(t, []))]
+                if subset.empty:
+                    continue
+                st.subheader(f"🏷️ {tag}  ·  {len(subset)}")
+                render_quote_table(subset, tags_map, type_map, detail, f"{_safe(selected_list)}-tag-{_safe(tag)}")
+
+            # Stocks with no tags (only when not filtering by specific tags)
+            if not tag_filter:
+                untagged = df[df["Ticker"].map(lambda t: not tags_map.get(t))]
+                if not untagged.empty:
+                    st.subheader(f"Untagged  ·  {len(untagged)}")
+                    render_quote_table(untagged, tags_map, type_map, detail, f"{_safe(selected_list)}-untagged")
+        else:
+            render_quote_table(df, tags_map, type_map, detail, f"{_safe(selected_list)}-main")
+
+    with col_news:
+        with st.spinner("Fetching news…"):
+            news_items = fetch_news(news_entries)
+        tickers_with_news = sorted({t for it in news_items for t in it["tickers"]})
+
+        # Stock picker at the top of the news column (aligns with the table top); it
+        # only offers stocks that actually have news, and filters the news box below.
+        news_pick = st.multiselect(
+            "Filter news by stock",
+            tickers_with_news,
+            key=f"news_pick::{selected_list}",
+            placeholder="Filter news by stock",
+            label_visibility="collapsed",
+            disabled=not tickers_with_news,
+        )
+        if news_pick:
+            sel = set(news_pick)
+            shown_news = [it for it in news_items if sel & set(it["tickers"])]
+        else:
+            shown_news = news_items
+
+        # Cap the news box to the table's height so it never runs longer than the table.
+        rows = min(len(df), 50)
+        table_height = (rows + 1) * 35 + 3
+        news_panel(shown_news, max_height=table_height)
+
+
+def render_edit_screen(watchlists: dict[str, list[str]]):
+    st.title("Edit watchlists")
+
+    tab_create, tab_rename, tab_reorder, tab_add, tab_status, tab_tags, tab_del_item, tab_del_list = st.tabs(
+        ["Create list", "Rename list", "Reorder", "Add stock", "Set status", "Tags", "Remove stock", "Delete list"]
+    )
+
+    # ── Create a new watchlist ─────────────────────────────────────────────────
+    with tab_create:
+        with st.form("new_list_form", clear_on_submit=True):
+            new_name = st.text_input("New watchlist name")
+            new_status = st.radio(
+                "Type",
+                STATUS_OPTIONS,
+                format_func=lambda s: STATUS_LABELS[s],
+                horizontal=True,
+            )
+            if st.form_submit_button("Create", type="primary"):
+                name = new_name.strip()
+                if not name:
+                    st.warning("Enter a name.")
+                elif create_watchlist(name, new_status):
+                    st.success(f"Created “{name}”.")
+                    st.rerun()
+                else:
+                    st.error(f"“{name}” already exists.")
+
+    # ── Rename a watchlist ─────────────────────────────────────────────────────
+    with tab_rename:
+        if not watchlists:
+            st.info("No watchlists to rename.")
+        else:
+            old_name = st.selectbox("Watchlist", list(watchlists.keys()), key="rename_target")
+            renamed = st.text_input("New name", value=old_name, key="rename_value")
+            if st.button("Rename", type="primary"):
+                clean = renamed.strip()
+                if not clean:
+                    st.warning("Enter a name.")
+                elif clean == old_name:
+                    st.info("Name unchanged.")
+                elif rename_watchlist(old_name, clean):
+                    st.success(f"Renamed “{old_name}” to “{clean}”.")
+                    st.rerun()
+                else:
+                    st.error(f"“{clean}” already exists.")
+
+    # ── Reorder watchlists ─────────────────────────────────────────────────────
+    with tab_reorder:
+        names = list(watchlists.keys())
+        if not names:
+            st.info("No watchlists to reorder.")
+        else:
+            st.caption("Use the arrows to change the order shown in the left menu.")
+            for i, name in enumerate(names):
+                c_name, c_up, c_down = st.columns([6, 1, 1])
+                c_name.markdown(f"**{i + 1}.** {name}")
+                if c_up.button("↑", key=f"mv_up_{name}", disabled=(i == 0)):
+                    names[i - 1], names[i] = names[i], names[i - 1]
+                    set_watchlist_order(names)
+                    st.rerun()
+                if c_down.button("↓", key=f"mv_down_{name}", disabled=(i == len(names) - 1)):
+                    names[i + 1], names[i] = names[i], names[i + 1]
+                    set_watchlist_order(names)
+                    st.rerun()
+
+    # ── Add a stock (with Yahoo validation) ────────────────────────────────────
+    with tab_add:
+        if not watchlists:
+            st.info("Create a watchlist first.")
+        else:
+            target_list = st.selectbox("Watchlist", list(watchlists.keys()), key="add_target")
+            new_ticker = st.text_input("Ticker symbol", placeholder="e.g. AAPL", key="add_ticker")
+
+            if st.button("Check symbol"):
+                ticker = new_ticker.strip().upper()
+                if not ticker:
+                    st.session_state.pop("pending_add", None)
+                    st.warning("Enter a ticker.")
+                else:
+                    with st.spinner(f"Looking up {ticker}…"):
+                        st.session_state["pending_add"] = validate_ticker(ticker)
+
+            pending = st.session_state.get("pending_add")
+            if pending:
+                if not pending["ok"]:
+                    st.error(pending["error"])
+                else:
+                    freshness = (
+                        "🟢 Regularly updated"
+                        if pending["fresh"]
+                        else "🟠 Not updated recently — may be stale/delisted"
+                    )
+                    st.markdown(
+                        f"""
+                        <div style="background:#ffffff; border:1.5px solid #4a90d9;
+                                    border-radius:10px; padding:12px 14px; margin:6px 0;
+                                    box-shadow:0 1px 4px rgba(0,0,0,.08); max-width:420px">
+                            <div style="font-weight:700; color:#1a1a2e">{pending['name']}</div>
+                            <div style="color:#555; font-size:.9em; margin-top:3px">{pending['ticker']} · {pending['exchange']}</div>
+                            <div style="color:#555; font-size:.9em; margin-top:3px">{fmt_price(pending['price'])} {pending['currency']}</div>
+                            <div style="color:#888; font-size:.82em; margin-top:3px">Last update: {pending['last_update']}</div>
+                            <div style="font-size:.85em; margin-top:6px">{freshness}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    c1, c2, _ = st.columns([1, 1, 3])
+                    with c1:
+                        if st.button("Confirm add", type="primary"):
+                            if add_item(target_list, pending["ticker"]):
+                                st.success(f"Added {pending['ticker']} to “{target_list}”.")
+                                st.session_state.pop("pending_add", None)
+                                st.cache_data.clear()
+                                st.rerun()
+                            else:
+                                st.error(f"{pending['ticker']} is already in “{target_list}”.")
+                    with c2:
+                        if st.button("Cancel"):
+                            st.session_state.pop("pending_add", None)
+                            st.rerun()
+
+    # ── Set a watchlist's status (held vs target) ──────────────────────────────
+    with tab_status:
+        if not watchlists:
+            st.info("No watchlists to update.")
+        else:
+            statuses = get_watchlist_statuses()
+            s_list = st.selectbox(
+                "Watchlist",
+                list(watchlists.keys()),
+                format_func=lambda n: f"{n}  ({STATUS_LABELS[statuses.get(n, 'target')]})",
+                key="status_list",
+            )
+            new_status = st.radio(
+                "Type",
+                STATUS_OPTIONS,
+                index=STATUS_OPTIONS.index(statuses.get(s_list, "target"))
+                if statuses.get(s_list, "target") in STATUS_OPTIONS else 0,
+                format_func=lambda s: STATUS_LABELS[s],
+                horizontal=True,
+                key="status_value",
+            )
+            if st.button("Save status", type="primary"):
+                set_watchlist_status(s_list, new_status)
+                st.success(f"“{s_list}” marked as {STATUS_LABELS[new_status]}.")
+                st.rerun()
+
+    # ── Assign tags to a stock ─────────────────────────────────────────────────
+    with tab_tags:
+        non_empty = {k: v for k, v in watchlists.items() if v}
+        if not non_empty:
+            st.info("No stocks to tag.")
+        else:
+            tag_list = st.selectbox("Watchlist", list(non_empty.keys()), key="tag_list")
+            tag_ticker = st.selectbox("Stock", non_empty[tag_list], key="tag_ticker")
+            current = get_tags(tag_ticker)
+            options = sorted(set(get_all_tags()) | set(current))
+            chosen = st.multiselect(
+                "Tags (type to add a new one)",
+                options,
+                default=current,
+                accept_new_options=True,
+                key=f"tag_choice::{tag_list}::{tag_ticker}",
+            )
+            st.caption("Deselect a tag and press Save to remove it from this stock.")
+            c_save, c_clear = st.columns([1, 1])
+            with c_save:
+                if st.button("Save tags", type="primary"):
+                    set_tags(tag_ticker, chosen)
+                    label = ", ".join(chosen) if chosen else "no tags"
+                    st.success(f"{tag_ticker}: {label}.")
+                    st.rerun()
+            with c_clear:
+                if st.button("Remove all tags", disabled=not current):
+                    set_tags(tag_ticker, [])
+                    st.success(f"Removed all tags from {tag_ticker}.")
+                    st.rerun()
+
+    # ── Remove a stock from a watchlist ────────────────────────────────────────
+    with tab_del_item:
+        non_empty = {k: v for k, v in watchlists.items() if v}
+        if not non_empty:
+            st.info("No stocks to remove.")
+        else:
+            del_list = st.selectbox("Watchlist", list(non_empty.keys()), key="del_item_list")
+            del_ticker = st.selectbox("Stock to remove", non_empty[del_list], key="del_item_ticker")
+            if st.button("Remove stock", type="primary"):
+                delete_item(del_list, del_ticker)
+                st.success(f"Removed {del_ticker} from “{del_list}”.")
+                st.cache_data.clear()
+                st.rerun()
+
+    # ── Delete a whole watchlist ───────────────────────────────────────────────
+    with tab_del_list:
+        if not watchlists:
+            st.info("No watchlists to delete.")
+        else:
+            del_wl = st.selectbox("Watchlist to delete", list(watchlists.keys()), key="del_wl")
+            count = len(watchlists.get(del_wl, []))
+            st.warning(f"This will permanently delete “{del_wl}” and its {count} stock(s).")
+            confirm = st.checkbox("Yes, I'm sure", key="del_wl_confirm")
+            if st.button("Delete watchlist", type="primary", disabled=not confirm):
+                delete_watchlist(del_wl)
+                st.success(f"Deleted “{del_wl}”.")
+                st.rerun()
+
+
+def render_refresh_screen():
+    st.title("Refresh options")
+    st.caption("Control how the monitor keeps quotes up to date.")
+
+    st.toggle("Auto-refresh", key="auto_refresh")
+    if st.session_state.get("auto_refresh"):
+        st.selectbox(
+            "Refresh every",
+            [30, 60, 120, 300],
+            format_func=lambda s: f"{s} seconds",
+            key="auto_interval",
+        )
+        st.success("Auto-refresh is on — the monitor reloads quotes on the chosen interval.")
+    else:
+        st.info("Auto-refresh is off. Use ‘Refresh now’ below for a one-off update.")
+
+    st.divider()
+    if st.button("🔄 Refresh now", type="primary"):
+        st.cache_data.clear()
+        st.toast("Quotes refreshed.")
+
+
+# ── Navigation (native sidebar menu) ───────────────────────────────────────────
+ALL_LABEL = "⭐ All"
+
+
+def _slug(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return s or "list"
+
+
+def _make_monitor_page(list_name: str):
+    def _page():
+        watchlists = get_watchlists()
+        auto = st.session_state.get("auto_refresh", False)
+        interval = st.session_state.get("auto_interval", 60)
+        if auto:
+            @st.fragment(run_every=f"{interval}s")
+            def _live():
+                st.cache_data.clear()
+                render_monitor(list_name, watchlists)
+            _live()
+        else:
+            render_monitor(list_name, watchlists)
+    return _page
+
+
+def _edit_page():
+    render_edit_screen(get_watchlists())
+
+
+WATCHLISTS = get_watchlists()
+STATUSES = get_watchlist_statuses()
+
+watchlist_pages = [
+    st.Page(_make_monitor_page(ALL_LABEL), title="All", icon="⭐", url_path="all", default=True)
+]
+for name in WATCHLISTS:
+    icon = STATUS_ICONS.get(STATUSES.get(name, "target"), "🎯")
+    watchlist_pages.append(
+        st.Page(_make_monitor_page(name), title=name, icon=icon, url_path=_slug(name))
+    )
+
+settings_pages = [
+    st.Page(_edit_page, title="Edit Watchlists", icon="✏️", url_path="edit"),
+    st.Page(render_refresh_screen, title="Refresh Options", icon="🔄", url_path="refresh"),
+]
+
+nav = st.navigation({"Watchlists": watchlist_pages, "Settings": settings_pages})
+nav.run()

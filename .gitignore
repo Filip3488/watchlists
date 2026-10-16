@@ -1,0 +1,20 @@
+# Secrets — never commit the MotherDuck access token
+.env
+.streamlit/secrets.toml
+
+# Local databases (the app uses MotherDuck now; these are local leftovers)
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
