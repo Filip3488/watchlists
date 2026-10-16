@@ -105,6 +105,14 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ticker_names (
+                ticker TEXT PRIMARY KEY,
+                name   TEXT
+            )
+            """
+        )
         # Migrate older DBs that predate the watchlist status column
         cols = [r[1] for r in conn.execute("PRAGMA table_info('watchlists')").fetchall()]
         if "status" not in cols:
@@ -259,6 +267,24 @@ def get_all_tags() -> list[str]:
     with get_conn() as conn:
         used = [r[0] for r in conn.execute("SELECT DISTINCT tag FROM stock_tags").fetchall()]
     return sorted(set(TAGS) | set(used))
+
+
+def get_ticker_names() -> dict[str, str]:
+    """Manually-maintained display names, keyed by ticker. Empty names are omitted."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT ticker, name FROM ticker_names WHERE name IS NOT NULL AND name <> ''"
+        ).fetchall()
+    return dict(rows)
+
+
+def set_ticker_name(ticker: str, name: str):
+    """Set (or clear, when name is blank) the manual display name for a ticker."""
+    name = (name or "").strip()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM ticker_names WHERE ticker = ?", [ticker])
+        if name:
+            conn.execute("INSERT INTO ticker_names (ticker, name) VALUES (?, ?)", [ticker, name])
 
 
 init_db()
@@ -791,13 +817,19 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
     with st.spinner("Fetching quotes…"):
         df = fetch_quotes(tickers)
 
+    # Manual display names (maintained on the Edit screen) take precedence over the
+    # auto-fetched name, which falls back to the ticker when yfinance is unavailable.
+    manual_names = get_ticker_names()
+    if manual_names:
+        df["Name"] = df.apply(lambda r: manual_names.get(r["Ticker"]) or r["Name"], axis=1)
+
     st.caption(f"Data as of {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Per-list default control states (applied once; the user can still change them)
     st.session_state.setdefault(f"only_today::{selected_list}", selected_list == ALL_LABEL)
     st.session_state.setdefault(f"groupby::{selected_list}", selected_list == "Indices")
     if selected_list == ALL_LABEL:
-        st.session_state.setdefault("list_status_filter", ["🎯 Target", "🟢 Held"])
+        st.session_state.setdefault("list_status_filter", ["🟢 Held"])
 
     # The two groupings are mutually exclusive — turning one on turns the other off
     tag_key = f"groupby::{selected_list}"
@@ -960,8 +992,8 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
 def render_edit_screen(watchlists: dict[str, list[str]]):
     st.title("Edit watchlists")
 
-    tab_create, tab_rename, tab_reorder, tab_add, tab_status, tab_tags, tab_del_item, tab_del_list = st.tabs(
-        ["Create list", "Rename list", "Reorder", "Add stock", "Set status", "Tags", "Remove stock", "Delete list"]
+    tab_create, tab_rename, tab_reorder, tab_add, tab_status, tab_tags, tab_names, tab_del_item, tab_del_list = st.tabs(
+        ["Create list", "Rename list", "Reorder", "Add stock", "Set status", "Tags", "Names", "Remove stock", "Delete list"]
     )
 
     # ── Create a new watchlist ─────────────────────────────────────────────────
@@ -1134,6 +1166,45 @@ def render_edit_screen(watchlists: dict[str, list[str]]):
                     set_tags(tag_ticker, [])
                     st.success(f"Removed all tags from {tag_ticker}.")
                     st.rerun()
+
+    # ── Maintain manual display names for tickers ──────────────────────────────
+    with tab_names:
+        all_tickers = sorted({t for lst in watchlists.values() for t in lst})
+        if not all_tickers:
+            st.info("No stocks yet. Add some on the ‘Add stock’ tab.")
+        else:
+            st.caption(
+                "Set a display name per ticker. Manual names override the auto-fetched "
+                "name (useful when yfinance can't be reached, e.g. on Streamlit Cloud). "
+                "Leave blank to fall back to the automatic name."
+            )
+            names = get_ticker_names()
+            editor_df = pd.DataFrame(
+                {"Ticker": all_tickers, "Name": [names.get(t, "") for t in all_tickers]}
+            )
+            edited = st.data_editor(
+                editor_df,
+                hide_index=True,
+                use_container_width=True,
+                disabled=["Ticker"],
+                column_config={
+                    "Ticker": st.column_config.TextColumn("Ticker"),
+                    "Name": st.column_config.TextColumn(
+                        "Name", help="Manual display name (overrides the auto name)"
+                    ),
+                },
+                key="names_editor",
+            )
+            if st.button("Save names", type="primary"):
+                changed = 0
+                for _, r in edited.iterrows():
+                    new = (r["Name"] or "").strip()
+                    if new != names.get(r["Ticker"], ""):
+                        set_ticker_name(r["Ticker"], new)
+                        changed += 1
+                st.cache_data.clear()
+                st.success(f"Saved {changed} change(s).")
+                st.rerun()
 
     # ── Remove a stock from a watchlist ────────────────────────────────────────
     with tab_del_item:
