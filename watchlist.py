@@ -820,22 +820,33 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
     # Per-list default control states (applied once; the user can still change them)
     st.session_state.setdefault(f"only_today::{selected_list}", selected_list == ALL_LABEL)
     st.session_state.setdefault(f"groupby::{selected_list}", selected_list == "Indices")
+    st.session_state.setdefault(f"groupwl::{selected_list}", selected_list == ALL_LABEL)
     if selected_list == ALL_LABEL:
         st.session_state.setdefault("list_status_filter", ["🟢 Held"])
 
-    # The two groupings are mutually exclusive — turning one on turns the other off
+    # The three groupings are mutually exclusive — turning one on turns the others off
     tag_key = f"groupby::{selected_list}"
     type_key = f"grouptype::{selected_list}"
+    wl_key = f"groupwl::{selected_list}"
 
     def _excl_tag():
         if st.session_state.get(tag_key):
             st.session_state[type_key] = False
+            st.session_state[wl_key] = False
 
     def _excl_type():
         if st.session_state.get(type_key):
             st.session_state[tag_key] = False
+            st.session_state[wl_key] = False
 
-    c_today, c_status, c_grouptype, c_tags, c_group = st.columns([2, 2, 2, 3, 2])
+    def _excl_wl():
+        if st.session_state.get(wl_key):
+            st.session_state[tag_key] = False
+            st.session_state[type_key] = False
+
+    c_today, c_status, c_grouptype, c_wlfilter, c_groupwl, c_tags, c_group = st.columns(
+        [2, 2, 2, 2, 2, 2, 2]
+    )
     with c_today:
         only_today = st.toggle("Show only stocks updated today", key=f"only_today::{selected_list}")
     with c_status:
@@ -851,6 +862,16 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
         )
     with c_grouptype:
         group_by_type = st.toggle("Group by type", key=type_key, on_change=_excl_type)
+    with c_wlfilter:
+        wl_filter = st.multiselect(
+            "Filter by watchlist",
+            list(watchlists.keys()),
+            key=f"wlfilter::{selected_list}",
+            placeholder="Filter by watchlist",
+            label_visibility="collapsed",
+        )
+    with c_groupwl:
+        group_by_watchlist = st.toggle("Group by watchlist", key=wl_key, on_change=_excl_wl)
     with c_tags:
         tag_filter = st.multiselect(
             "Filter by tags",
@@ -890,6 +911,10 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
     if tag_filter:
         wanted_tags = set(tag_filter)
         df = df[df["Ticker"].map(lambda t: bool(set(tags_map.get(t, [])) & wanted_tags))].reset_index(drop=True)
+
+    if wl_filter:
+        allowed_wl = {t for name in wl_filter for t in watchlists.get(name, [])}
+        df = df[df["Ticker"].isin(allowed_wl)].reset_index(drop=True)
 
     if df.empty:
         st.info("No stocks match the current filters.")
@@ -951,6 +976,16 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
                 if not untagged.empty:
                     st.subheader(f"Untagged  ·  {len(untagged)}")
                     render_quote_table(untagged, tags_map, type_map, detail, f"{_safe(selected_list)}-untagged")
+        elif group_by_watchlist:
+            # One table per watchlist. Which watchlists: the active filter, else all.
+            group_wls = wl_filter if wl_filter else list(watchlists.keys())
+            for name in group_wls:
+                subset = df[df["Ticker"].isin(set(watchlists.get(name, [])))]
+                if subset.empty:
+                    continue
+                icon = STATUS_ICONS.get(all_statuses.get(name, "target"), "🎯")
+                st.subheader(f"{icon} {name}  ·  {len(subset)}")
+                render_quote_table(subset, tags_map, type_map, detail, f"{_safe(selected_list)}-wl-{_safe(name)}")
         else:
             render_quote_table(df, tags_map, type_map, detail, f"{_safe(selected_list)}-main")
 
