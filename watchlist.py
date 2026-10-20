@@ -132,6 +132,21 @@ def init_db():
         if "currency" not in tn_cols:
             conn.execute("ALTER TABLE ticker_names ADD COLUMN currency TEXT")
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS perf_presets (
+                name        TEXT PRIMARY KEY,
+                tickers     TEXT NOT NULL,
+                main_ticker TEXT
+            )
+            """
+        )
+
+        # Migrate perf_presets created before the main_ticker column existed
+        pp_cols = [r[1] for r in conn.execute("PRAGMA table_info('perf_presets')").fetchall()]
+        if "main_ticker" not in pp_cols:
+            conn.execute("ALTER TABLE perf_presets ADD COLUMN main_ticker TEXT")
+
         # Seed defaults only if the DB is empty
         empty = conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0] == 0
         if empty:
@@ -1315,6 +1330,516 @@ def render_refresh_screen():
         st.toast("Quotes refreshed.")
 
 
+# ── Performance Comparison ──────────────────────────────────────────────────────
+
+def get_perf_presets() -> dict[str, dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT name, tickers, main_ticker FROM perf_presets ORDER BY name").fetchall()
+    return {
+        name: {"tickers": tickers.split(","), "main_ticker": main_ticker}
+        for name, tickers, main_ticker in rows
+    }
+
+
+def save_perf_preset(name: str, tickers: list[str], main_ticker: str | None = None):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO perf_presets (name, tickers, main_ticker) VALUES (?, ?, ?)
+            ON CONFLICT (name) DO UPDATE SET tickers = excluded.tickers, main_ticker = excluded.main_ticker
+            """,
+            [name, ",".join(tickers), main_ticker or None],
+        )
+
+
+def delete_perf_preset(name: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM perf_presets WHERE name = ?", [name])
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_perf_history(tickers_tuple: tuple[str, ...], auto_adjust: bool = True) -> dict[str, pd.Series]:
+    """Download up to 11 years of daily close prices in one batched call.
+    auto_adjust=True  → adjusted close (total return incl. dividends)
+    auto_adjust=False → unadjusted close (price return only)"""
+    if not tickers_tuple:
+        return {}
+    try:
+        data = yf.download(
+            list(tickers_tuple),
+            period="16y",
+            interval="1d",
+            group_by="ticker",
+            progress=False,
+            threads=True,
+            auto_adjust=auto_adjust,
+        )
+    except Exception:
+        return {}
+    if data is None or data.empty:
+        return {}
+    out: dict[str, pd.Series] = {}
+    multi = isinstance(data.columns, pd.MultiIndex)
+    for t in tickers_tuple:
+        try:
+            closes = (data[t]["Close"] if multi else data["Close"]).dropna()
+            if not closes.empty:
+                out[t] = closes
+        except Exception:
+            continue
+    return out
+
+
+def _calc_performance(series: pd.Series) -> dict[str, float | None]:
+    """Return YTD, 1Y, 5Y CAGR, 10Y CAGR, 15Y CAGR as decimals (0.10 = +10%)."""
+    if series.empty:
+        return {"YTD": None, "1Y": None, "5Y CAGR": None, "10Y CAGR": None, "15Y CAGR": None}
+
+    today = series.index[-1]
+    current = float(series.iloc[-1])
+
+    def _prev(target) -> float | None:
+        mask = series.index <= pd.Timestamp(target)
+        return float(series[mask].iloc[-1]) if mask.any() else None
+
+    ytd_p  = _prev(pd.Timestamp(today.year, 1, 1))
+    one_p  = _prev(today - pd.DateOffset(years=1))
+    five_p = _prev(today - pd.DateOffset(years=5))
+    ten_p   = _prev(today - pd.DateOffset(years=10))
+    fifte_p = _prev(today - pd.DateOffset(years=15))
+
+    return {
+        "YTD":       (current / ytd_p  - 1)                  if ytd_p   else None,
+        "1Y":        (current / one_p  - 1)                   if one_p   else None,
+        "5Y CAGR":   (current / five_p) ** (1 / 5)  - 1      if five_p  else None,
+        "10Y CAGR":  (current / ten_p)  ** (1 / 10) - 1      if ten_p   else None,
+        "15Y CAGR":  (current / fifte_p) ** (1 / 15) - 1     if fifte_p else None,
+    }
+
+
+def _point_cagr(series: pd.Series, years: int) -> float | None:
+    """Plain point-to-point CAGR: last price vs the price `years` ago."""
+    if series.empty:
+        return None
+    end_date = series.index[-1]
+    target = end_date - pd.DateOffset(years=years)
+    if target < series.index[0]:
+        return None
+    p0 = float(series.asof(target))
+    p1 = float(series.iloc[-1])
+    if not p0 or p0 <= 0:
+        return None
+    return (p1 / p0) ** (1 / years) - 1
+
+
+def _endpoint_avg_cagr(series: pd.Series, years: int, win: int = 21) -> float | None:
+    """Endpoint-averaged CAGR: averages ~1 trading month around each endpoint so a
+    single freak price on the start or end day cannot dominate the result."""
+    if series.empty:
+        return None
+    end_date = series.index[-1]
+    target = end_date - pd.DateOffset(years=years)
+    if target < series.index[0]:
+        return None
+    end_avg = float(series.iloc[-win:].mean())
+    pos = series.index.get_indexer([pd.Timestamp(target)], method="nearest")[0]
+    lo, hi = max(0, pos - win // 2), min(len(series), pos + win // 2 + 1)
+    start_avg = float(series.iloc[lo:hi].mean())
+    if not start_avg or start_avg <= 0:
+        return None
+    return (end_avg / start_avg) ** (1 / years) - 1
+
+
+def _rolling_median_cagr(series: pd.Series, years: int) -> tuple[float | None, int]:
+    """Median of the `years`-length CAGR computed from every monthly start date in
+    history. Answers 'what was a typical N-year outcome?', independent of one lucky
+    or unlucky start date. Returns (median, number_of_windows_used)."""
+    if series.empty:
+        return None, 0
+    end_date = series.index[-1]
+    last_start = end_date - pd.DateOffset(years=years)
+    # Underlying data is daily closes; we sample start points at month-end cadence
+    # ("ME" labels each bucket at its month-end date, so the start price and the
+    # start+years lookup are both anchored to month-end and stay aligned).
+    monthly = series.resample("ME").last().dropna()
+    starts = monthly.index[monthly.index <= last_start]
+    cagrs = []
+    for t in starts:
+        p0 = float(monthly.loc[t])
+        p1 = series.asof(t + pd.DateOffset(years=years))
+        if p0 and p0 > 0 and p1 and not pd.isna(p1):
+            cagrs.append((float(p1) / p0) ** (1 / years) - 1)
+    if not cagrs:
+        return None, 0
+    return float(pd.Series(cagrs).median()), len(cagrs)
+
+
+def _period_start(series: pd.Series, period: str) -> pd.Timestamp:
+    """Map a period label (YTD / 1Y / 5Y CAGR / …) to a start date for the series."""
+    end = series.index[-1]
+    if period == "YTD":
+        return pd.Timestamp(end.year, 1, 1)
+    years = {"1Y": 1, "5Y CAGR": 5, "10Y CAGR": 10, "15Y CAGR": 15}[period]
+    return end - pd.DateOffset(years=years)
+
+
+
+import altair as alt
+
+
+@st.fragment
+def _perf_charts(df: pd.DataFrame, periods: list[str], main_ticker: str):
+    ctrl_col, lbl_col = st.columns([3, 1], vertical_alignment="bottom")
+    with ctrl_col:
+        period = st.radio("Period", periods, horizontal=True, key="perf_period_radio")
+    with lbl_col:
+        show_labels = st.toggle("Value labels", value=False)
+
+    chart_df = df[[period]].dropna().copy()
+    if chart_df.empty:
+        st.caption(f"No {period} data available for the selected stocks.")
+        return
+
+    chart_df[period] = chart_df[period] * 100
+    chart_df = chart_df.sort_values(period, ascending=False).reset_index()
+    chart_df["Sign"] = chart_df[period].map(
+        lambda x: "▲ Positive" if x >= 0 else "▼ Negative"
+    )
+    chart_df["Label"] = chart_df[period].map(lambda x: f"{x:+.1f}%")
+    chart_df["TickerLabel"] = chart_df["Ticker"].map(
+        lambda t: f"★ {t}" if t == main_ticker else t
+    )
+    ticker_order = chart_df["TickerLabel"].tolist()
+
+    bar_height = max(240, len(chart_df) * 56)
+    base = alt.Chart(chart_df).encode(
+        y=alt.Y(
+            "TickerLabel:N",
+            sort=ticker_order,
+            title=None,
+            axis=alt.Axis(labelFontSize=13, labelFontWeight=alt.ExprRef(
+                "indexof(datum.label, '★') >= 0 ? 'bold' : 'normal'"
+            )),
+        ),
+        x=alt.X(f"{period}:Q", title="Return (%)"),
+        color=alt.Color(
+            "Sign:N",
+            scale=alt.Scale(
+                domain=["▲ Positive", "▼ Negative"],
+                range=["#28a745", "#d9534f"],
+            ),
+            legend=alt.Legend(title=None, orient="top"),
+        ),
+        tooltip=[
+            alt.Tooltip("Ticker:N"),
+            alt.Tooltip(f"{period}:Q", format="+.2f", title="Return (%)"),
+        ],
+    )
+
+    bars = base.mark_bar(cornerRadiusEnd=4).properties(height=bar_height)
+
+    zero_rule = (
+        alt.Chart(pd.DataFrame({"x": [0]}))
+        .mark_rule(color="#888", strokeDash=[4, 4], strokeWidth=1.5)
+        .encode(x="x:Q")
+    )
+
+    if show_labels:
+        labels_pos = base.mark_text(
+            align="left", dx=5, fontSize=11, fontWeight="bold", color="#333",
+        ).encode(
+            text="Label:N",
+            x=alt.X(f"{period}:Q"),
+        ).transform_filter(
+            alt.datum[period] >= 0
+        ).properties(height=bar_height)
+        labels_neg = base.mark_text(
+            align="right", dx=-5, fontSize=11, fontWeight="bold", color="#333",
+        ).encode(
+            text="Label:N",
+            x=alt.X(f"{period}:Q"),
+        ).transform_filter(
+            alt.datum[period] < 0
+        ).properties(height=bar_height)
+        st.altair_chart(bars + zero_rule + labels_pos + labels_neg, use_container_width=True)
+    else:
+        st.altair_chart(bars + zero_rule, use_container_width=True)
+
+
+@st.fragment
+def _cagr_methods(history: dict, name_map: dict, main_ticker: str, all_tickers: list[str]):
+    """Compare three ways of computing CAGR side by side for one window, so the
+    start-date sensitivity of each method is visible at a glance."""
+    window = st.radio("Window", ["5Y", "10Y", "15Y"], index=1, horizontal=True, key="cagr_method_window")
+    years = int(window[:-1])
+    methods = ["Point-to-point", "Endpoint-avg", "Rolling median"]
+
+    rows = []
+    for t in all_tickers:
+        s = history.get(t)
+        if s is None or s.empty:
+            vals = {m: None for m in methods}
+            n_windows, since = 0, None
+        else:
+            roll_median, n_windows = _rolling_median_cagr(s, years)
+            vals = {
+                "Point-to-point": _point_cagr(s, years),
+                "Endpoint-avg":   _endpoint_avg_cagr(s, years),
+                "Rolling median": roll_median,
+            }
+            since = s.index[0]
+        rows.append({
+            "Ticker": t, "Name": name_map.get(t, t), **vals,
+            "Rolling n": n_windows,
+            "Data since": since.strftime("%Y-%m-%d") if since is not None else "—",
+        })
+
+    mdf = pd.DataFrame(rows)
+    mdf = mdf.sort_values("Rolling median", ascending=False, na_position="last")
+
+    def _fmt(val):
+        return "N/A" if pd.isna(val) else f"{val * 100:+.2f}%"
+
+    def _cell_color(val):
+        if pd.isna(val):
+            return "color: #999"
+        return f"color: {'#28a745' if val >= 0 else '#d9534f'}; font-weight: bold"
+
+    def _row_highlight(row):
+        if row.get("Ticker") == main_ticker:
+            return ["background-color: #fff8e1"] * len(row)
+        return [""] * len(row)
+
+    styled = (
+        mdf[["Ticker", "Name"] + methods + ["Rolling n", "Data since"]]
+        .style
+        .apply(_row_highlight, axis=1)
+        .map(_cell_color, subset=methods)
+        .format(_fmt, subset=methods, na_rep="N/A")
+        .hide(axis="index")
+    )
+    st.dataframe(styled, use_container_width=True)
+    st.caption(
+        "All methods use daily closing prices. "
+        "**Point-to-point**: last close vs the close exactly N years ago (one start date). "
+        "**Endpoint-avg**: averages ~21 daily closes around each endpoint. "
+        "**Rolling median**: median N-year CAGR over every **month-end** start date in history "
+        "(**Rolling n** = how many such windows existed; **Data since** = oldest price available)."
+    )
+
+
+@st.fragment
+def _rebased_chart(history: dict, main_ticker: str, all_tickers: list[str]):
+    """Indexed growth: every stock rebased to 100 at the start of the chosen window,
+    on a log axis so equal % moves are equal visual distances and the whole path —
+    not just the two endpoints — is visible. Plotly so it zooms/pans."""
+    import plotly.graph_objects as go
+
+    period = st.radio(
+        "Period", ["1Y", "5Y CAGR", "10Y CAGR", "15Y CAGR"],
+        horizontal=True, key="rebase_period",
+        format_func=lambda p: p.replace(" CAGR", ""),
+    )
+
+    fig = go.Figure()
+    plotted = 0
+    for t in all_tickers:
+        s = history.get(t)
+        if s is None or s.empty:
+            continue
+        start = _period_start(s, period)
+        s2 = s[s.index >= start]
+        if s2.empty or float(s2.iloc[0]) <= 0:
+            continue
+        rb = s2 / float(s2.iloc[0]) * 100
+        is_main = t == main_ticker
+        fig.add_trace(go.Scatter(
+            x=rb.index, y=rb.values, name=t, mode="lines",
+            line=dict(width=3.5 if is_main else 1.5),
+            hovertemplate=f"<b>{t}</b><br>%{{x|%Y-%m-%d}}<br>Index: %{{y:.1f}}<extra></extra>",
+        ))
+        plotted += 1
+
+    if plotted == 0:
+        st.caption("No data available for the selected period.")
+        return
+
+    fig.update_yaxes(type="log", title="Growth (start = 100)")
+    fig.update_xaxes(title=None)
+    fig.update_layout(
+        height=440,
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title=None),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_performance_page():
+    st.title("📊 Performance Comparison")
+
+    # ── Ticker selector ───────────────────────────────────────────────────────
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT i.ticker, COALESCE(n.name, i.ticker) AS display_name
+            FROM items i
+            LEFT JOIN ticker_names n ON n.ticker = i.ticker
+            ORDER BY i.ticker
+        """).fetchall()
+
+    if not rows:
+        st.info("No tickers found in your watchlists. Add some stocks first.")
+        return
+
+    name_map = {t: name for t, name in rows}
+
+    # ── Preset loader ─────────────────────────────────────────────────────────
+    presets = get_perf_presets()
+    if presets:
+        p_col, load_col, del_col = st.columns([4, 1.4, 0.7])
+        with p_col:
+            preset_choice = st.selectbox(
+                "Preset",
+                options=[""] + list(presets.keys()),
+                format_func=lambda x: "— select a preset —" if x == "" else x,
+                key="perf_preset_choice",
+                label_visibility="collapsed",
+            )
+        with load_col:
+            if st.button("⬇ Load preset", use_container_width=True, disabled=not preset_choice):
+                p = presets[preset_choice]
+                valid = [t for t in p["tickers"] if t in name_map]
+                st.session_state["perf_compare_tickers"] = valid
+                if p["main_ticker"] and p["main_ticker"] in name_map:
+                    st.session_state["perf_main_ticker"] = p["main_ticker"]
+                if len(valid) < len(p["tickers"]):
+                    missing = set(p["tickers"]) - set(valid)
+                    st.warning(f"Skipped {len(missing)} ticker(s) no longer in your watchlists: {', '.join(sorted(missing))}")
+                st.rerun()
+        with del_col:
+            if st.button("🗑️", use_container_width=True, disabled=not preset_choice, help="Delete this preset"):
+                delete_perf_preset(preset_choice)
+                st.rerun()
+
+    # ── Save as preset ────────────────────────────────────────────────────────
+    with st.expander("💾 Save current selection as preset"):
+        s_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
+        with s_col:
+            new_name = st.text_input("Preset name", placeholder="e.g. Tech Giants", key="perf_new_preset_name")
+        with btn_col:
+            current_tickers = st.session_state.get("perf_compare_tickers", [])
+            if st.button("Save", use_container_width=True, disabled=not (new_name.strip() and current_tickers)):
+                save_perf_preset(new_name.strip(), current_tickers)
+                st.success(f'Saved preset "{new_name.strip()}".')
+                st.rerun()
+
+    # ── Main stock + comparison selectors ─────────────────────────────────────
+    main_col, comp_col = st.columns([1, 2])
+    with main_col:
+        main_ticker = st.selectbox(
+            "Main stock",
+            options=[""] + list(name_map.keys()),
+            format_func=lambda t: "— none —" if t == "" else (f"{t} — {name_map[t]}" if name_map[t] != t else t),
+            key="perf_main_ticker",
+        )
+    with comp_col:
+        selected = st.multiselect(
+            "Compare with",
+            options=list(name_map.keys()),
+            format_func=lambda t: f"{t} — {name_map[t]}" if name_map[t] != t else t,
+            placeholder="Choose comparison stocks…",
+            key="perf_compare_tickers",
+        )
+
+    include_dividends = st.toggle("Include dividends (total return)", value=True)
+
+    # Combined ticker list: main stock always first
+    all_tickers = []
+    if main_ticker:
+        all_tickers.append(main_ticker)
+    for t in selected:
+        if t not in all_tickers:
+            all_tickers.append(t)
+
+    if not all_tickers:
+        st.info("Select a main stock or comparison stocks above to see their performance.")
+        return
+
+    with st.spinner("Fetching price history…"):
+        history = _fetch_perf_history(tuple(sorted(all_tickers)), auto_adjust=include_dividends)
+
+    if not history:
+        st.error("Could not fetch price data — please try again.")
+        return
+
+    # ── Build metrics DataFrame ───────────────────────────────────────────────
+    PERIODS = ["YTD", "1Y", "5Y CAGR", "10Y CAGR", "15Y CAGR"]
+    records = []
+    for ticker in all_tickers:
+        series = history.get(ticker)
+        metrics = (
+            _calc_performance(series)
+            if (series is not None and not series.empty)
+            else {p: None for p in PERIODS}
+        )
+        records.append({"Ticker": ticker, "Name": name_map.get(ticker, ticker), **metrics})
+
+    df = pd.DataFrame(records).set_index("Ticker")
+
+    # ── Styled returns table ──────────────────────────────────────────────────
+    st.subheader("Returns")
+
+    def _fmt(val):
+        return "N/A" if pd.isna(val) else f"{val * 100:+.2f}%"
+
+    def _cell_color(val):
+        if pd.isna(val):
+            return "color: #999"
+        return f"color: {'#28a745' if val >= 0 else '#d9534f'}; font-weight: bold"
+
+    def _row_highlight(row):
+        if row.get("Ticker") == main_ticker:
+            return ["background-color: #fff8e1"] * len(row)
+        return [""] * len(row)
+
+    display_df = df[["Name"] + PERIODS].reset_index()
+    styled = (
+        display_df
+        .style
+        .apply(_row_highlight, axis=1)
+        .map(_cell_color, subset=PERIODS)
+        .format(_fmt, subset=PERIODS, na_rep="N/A")
+        .hide(axis="index")
+    )
+    st.dataframe(styled, use_container_width=True)
+
+    # ── Rank table (main stock only) ──────────────────────────────────────────
+    if main_ticker and main_ticker in df.index:
+        st.subheader(f"Rank — {main_ticker}")
+        rank_row = {}
+        for period in PERIODS:
+            vals = df[period].dropna()
+            main_val = df.loc[main_ticker, period] if main_ticker in vals.index else None
+            if main_val is not None and not pd.isna(main_val):
+                rank = int((vals > main_val).sum()) + 1
+                rank_row[period] = f"{rank} / {len(vals)}"
+            else:
+                rank_row[period] = "N/A"
+        rank_df = pd.DataFrame([rank_row], index=[main_ticker])
+        st.dataframe(rank_df, use_container_width=True)
+
+    # ── CAGR method comparison ────────────────────────────────────────────────
+    st.subheader("CAGR method comparison")
+    _cagr_methods(history, name_map, main_ticker, all_tickers)
+
+    # ── Indexed growth (rebased to 100) ───────────────────────────────────────
+    st.subheader("Indexed growth (rebased to 100)")
+    _rebased_chart(history, main_ticker, all_tickers)
+
+    # ── Bar charts (one tab per period) ───────────────────────────────────────
+    st.subheader("Chart")
+    _perf_charts(df, PERIODS, main_ticker)
+
+
 # ── Navigation (native sidebar menu) ───────────────────────────────────────────
 ALL_LABEL = "⭐ All"
 
@@ -1356,10 +1881,18 @@ for name in WATCHLISTS:
         st.Page(_make_monitor_page(name), title=name, icon=icon, url_path=_slug(name))
     )
 
+analysis_pages = [
+    st.Page(render_performance_page, title="Performance", icon="📊", url_path="performance"),
+]
+
 settings_pages = [
     st.Page(_edit_page, title="Edit Watchlists", icon="✏️", url_path="edit"),
     st.Page(render_refresh_screen, title="Refresh Options", icon="🔄", url_path="refresh"),
 ]
 
-nav = st.navigation({"Watchlists": watchlist_pages, "Settings": settings_pages})
+nav = st.navigation({
+    "Watchlists": watchlist_pages,
+    "Analysis": analysis_pages,
+    "Settings": settings_pages,
+})
 nav.run()
