@@ -1482,6 +1482,74 @@ def _period_start(series: pd.Series, period: str) -> pd.Timestamp:
     return end - pd.DateOffset(years=years)
 
 
+def _max_drawdown(series: pd.Series) -> float | None:
+    """Largest peak-to-trough decline over the whole series (negative, e.g. -0.55)."""
+    if series.empty:
+        return None
+    dd = series / series.cummax() - 1.0
+    return float(dd.min())
+
+
+def _avg_drawdown(series: pd.Series) -> float | None:
+    """Mean of the daily below-peak depth (negative). Small when the stock sits near
+    new highs most of the time, large when it spends long stretches deep underwater —
+    so one freak crash scores very differently from chronic deep corrections."""
+    if series.empty:
+        return None
+    dd = series / series.cummax() - 1.0
+    return float(dd.mean())
+
+
+def _annualized_vol(series: pd.Series) -> float | None:
+    """Std dev of daily returns, annualized (×√252)."""
+    if series.empty or len(series) < 2:
+        return None
+    rets = series.pct_change().dropna()
+    if rets.empty:
+        return None
+    return float(rets.std() * (252 ** 0.5))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _screen_candidates(region: str, min_mcap: float, sectors: tuple[str, ...], limit: int) -> list[tuple[str, str]]:
+    """Build a candidate pool from Yahoo's equity screener: stocks in `region` above
+    `min_mcap` market cap (optionally in `sectors`), largest first. Returns
+    (symbol, name) pairs. Yahoo filters on fundamentals only — the CAGR/drawdown
+    scoring happens locally afterwards."""
+    from yfinance import EquityQuery as EQ
+
+    filters = [
+        EQ("eq", ["region", region]),
+        EQ("gt", ["intradaymarketcap", float(min_mcap)]),
+    ]
+    if sectors:
+        if len(sectors) == 1:
+            filters.append(EQ("eq", ["sector", sectors[0]]))
+        else:
+            filters.append(EQ("or", [EQ("eq", ["sector", s]) for s in sectors]))
+    query = EQ("and", filters)
+
+    out: list[tuple[str, str]] = []
+    offset, page = 0, min(100, limit)
+    while len(out) < limit:
+        try:
+            r = yf.screen(query, offset=offset, size=page,
+                          sortField="intradaymarketcap", sortAsc=False)
+        except Exception:
+            break
+        quotes = r.get("quotes", []) if isinstance(r, dict) else []
+        if not quotes:
+            break
+        for qd in quotes:
+            sym = qd.get("symbol")
+            if sym:
+                out.append((sym, qd.get("shortName") or qd.get("longName") or sym))
+        offset += page
+        if offset >= (r.get("total") or 0):
+            break
+    return out[:limit]
+
+
 
 import altair as alt
 
@@ -1861,6 +1929,155 @@ def render_performance_page():
     _perf_charts(df, PERIODS, main_ticker)
 
 
+SCREENER_REGIONS = ["us", "de", "gb", "fr", "nl", "ch", "ca", "jp", "hk", "au", "it", "es", "se"]
+SCREENER_SECTORS = [
+    "Technology", "Healthcare", "Financial Services", "Consumer Cyclical",
+    "Consumer Defensive", "Communication Services", "Industrials", "Energy",
+    "Basic Materials", "Real Estate", "Utilities",
+]
+
+
+@st.fragment
+def _search_results(mdf: pd.DataFrame):
+    """Filter sliders + results table. A fragment so adjusting a threshold re-filters
+    the already-computed metrics instantly, without re-screening or re-downloading."""
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        min_cagr = st.slider("Min 10Y rolling CAGR (%)", -10.0, 40.0, 8.0, 0.5)
+    with c2:
+        max_dd = st.slider("Max drawdown allowed (%)", 10, 95, 60, 5,
+                           help="Exclude stocks whose worst peak-to-trough drop was deeper than this.")
+    with c3:
+        max_vol = st.slider("Max ann. volatility (%, 0 = off)", 0, 100, 0, 5)
+
+    f = mdf[mdf["10Y Rolling CAGR"].notna() & (mdf["10Y Rolling CAGR"] >= min_cagr / 100)].copy()
+    f = f[f["Max drawdown"].isna() | (f["Max drawdown"] >= -max_dd / 100)]
+    if max_vol > 0:
+        f = f[f["Ann. volatility"].isna() | (f["Ann. volatility"] <= max_vol / 100)]
+    f = f.sort_values("10Y Rolling CAGR", ascending=False)
+
+    st.caption(f"**{len(f)}** of {len(mdf)} scanned stocks match.")
+    if f.empty:
+        st.info("No stocks match these filters — loosen the thresholds.")
+        return
+
+    pct_cols = ["10Y Rolling CAGR", "10Y CAGR (point)", "Max drawdown", "Avg drawdown", "Ann. volatility"]
+
+    def _fmt(val):
+        return "N/A" if pd.isna(val) else f"{val * 100:+.1f}%"
+
+    def _color_cagr(val):
+        if pd.isna(val):
+            return "color: #999"
+        return f"color: {'#28a745' if val >= 0 else '#d9534f'}; font-weight: bold"
+
+    def _color_risk(val):
+        return "color: #999" if pd.isna(val) else "color: #d9534f"
+
+    disp = f[["Ticker", "Name"] + pct_cols + ["Rolling n", "Data since"]].copy()
+    # Ticker cell holds a TradingView URL; the real symbol is appended as a query
+    # param so the LinkColumn's display_text regex can show it as the label.
+    disp["Ticker"] = disp["Ticker"].map(lambda t: f"{tradingview_url(t, '')}&yfsym={t}")
+
+    styled = (
+        disp
+        .style
+        .map(_color_cagr, subset=["10Y Rolling CAGR", "10Y CAGR (point)"])
+        .map(_color_risk, subset=["Max drawdown", "Avg drawdown", "Ann. volatility"])
+        .format(_fmt, subset=pct_cols, na_rep="N/A")
+        .hide(axis="index")
+    )
+    st.dataframe(
+        styled, use_container_width=True,
+        column_config={
+            "Ticker": st.column_config.LinkColumn(
+                "Ticker", display_text=r"yfsym=(.+)$", help="Open chart on TradingView ↗"
+            ),
+        },
+    )
+
+
+def render_search_page():
+    st.title("🔎 Stock Search")
+    st.caption(
+        "Scan a candidate universe and rank by **rolling 10-year CAGR**, with filters on "
+        "how deep corrections go. Yahoo can only pre-filter on fundamentals, so returns and "
+        "drawdowns are computed locally from downloaded price history."
+    )
+
+    mode = st.radio("Candidate universe", ["Yahoo screener", "Custom list"], horizontal=True)
+
+    candidates: list[tuple[str, str]] = []
+    if mode == "Yahoo screener":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            region = st.selectbox("Region", SCREENER_REGIONS, index=0)
+        with c2:
+            min_mcap_b = st.number_input("Min market cap ($B)", min_value=0.1, value=10.0, step=1.0)
+        with c3:
+            limit = st.slider("Max candidates", 10, 200, 50, 10,
+                              help="More candidates = broader search but a longer download.")
+        sectors = st.multiselect("Sectors (optional)", SCREENER_SECTORS, placeholder="All sectors")
+        scan_cfg = {"mode": mode, "region": region, "min_mcap": min_mcap_b * 1e9,
+                    "sectors": tuple(sectors), "limit": limit}
+    else:
+        raw = st.text_area(
+            "Tickers", placeholder="AAPL, MSFT, NVDA  (comma, space or newline separated)",
+            height=100,
+        )
+        tickers = [t.strip().upper() for t in re.split(r"[,\s]+", raw) if t.strip()]
+        scan_cfg = {"mode": mode, "tickers": tickers}
+
+    if st.button("🔎 Scan", type="primary"):
+        with st.spinner("Resolving candidates…"):
+            if scan_cfg["mode"] == "Yahoo screener":
+                candidates = _screen_candidates(
+                    scan_cfg["region"], scan_cfg["min_mcap"], scan_cfg["sectors"], scan_cfg["limit"]
+                )
+            else:
+                candidates = [(t, t) for t in scan_cfg["tickers"]]
+
+        if not candidates:
+            st.warning("No candidates found — adjust the universe settings.")
+            st.session_state.pop("search_metrics", None)
+            return
+
+        name_map = {sym: name for sym, name in candidates}
+        symbols = list(name_map.keys())
+        with st.spinner(f"Downloading history for {len(symbols)} stocks…"):
+            history = _fetch_perf_history(tuple(sorted(symbols)), auto_adjust=True)
+
+        rows = []
+        for t in symbols:
+            s = history.get(t)
+            if s is None or s.empty:
+                continue
+            roll, n = _rolling_median_cagr(s, 10)
+            rows.append({
+                "Ticker": t, "Name": name_map.get(t, t),
+                "10Y Rolling CAGR": roll,
+                "10Y CAGR (point)": _point_cagr(s, 10),
+                "Max drawdown": _max_drawdown(s),
+                "Avg drawdown": _avg_drawdown(s),
+                "Ann. volatility": _annualized_vol(s),
+                "Rolling n": n,
+                "Data since": s.index[0].strftime("%Y-%m-%d"),
+            })
+        if not rows:
+            st.error("Could not fetch usable price history for any candidate.")
+            st.session_state.pop("search_metrics", None)
+            return
+        st.session_state["search_metrics"] = pd.DataFrame(rows)
+
+    mdf = st.session_state.get("search_metrics")
+    if mdf is None:
+        st.info("Set up your universe above, then click **Scan**.")
+        return
+
+    st.divider()
+    _search_results(mdf)
+
+
 # ── Navigation (native sidebar menu) ───────────────────────────────────────────
 ALL_LABEL = "⭐ All"
 
@@ -1904,6 +2121,7 @@ for name in WATCHLISTS:
 
 analysis_pages = [
     st.Page(render_performance_page, title="Performance", icon="📊", url_path="performance"),
+    st.Page(render_search_page, title="Search", icon="🔎", url_path="search"),
 ]
 
 settings_pages = [
