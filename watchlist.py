@@ -1752,17 +1752,38 @@ def render_performance_page():
 
     include_dividends = st.toggle("Include dividends (total return)", value=True)
 
-    # Combined ticker list: main stock always first
-    all_tickers = []
+    # Live selection (main stock always first)
+    live_tickers = []
     if main_ticker:
-        all_tickers.append(main_ticker)
+        live_tickers.append(main_ticker)
     for t in selected:
-        if t not in all_tickers:
-            all_tickers.append(t)
+        if t not in live_tickers:
+            live_tickers.append(t)
 
-    if not all_tickers:
-        st.info("Select a main stock or comparison stocks above to see their performance.")
+    # Loading is explicit: clicking the button snapshots the current selection into
+    # session state, and everything below renders from that snapshot (not the live
+    # widgets). This keeps the later radio-driven fragment reruns stable and avoids
+    # re-fetching every time a selector changes.
+    if st.button(
+        "🔄 Load & compare", type="primary", disabled=not live_tickers,
+        help="Fetch price history for all selected stocks in one batched request and build the comparison.",
+    ):
+        st.session_state["perf_loaded"] = {
+            "tickers": live_tickers, "main": main_ticker, "dividends": include_dividends,
+        }
+
+    loaded = st.session_state.get("perf_loaded")
+    if not loaded:
+        st.info("Select your stocks above, then click **Load & compare**.")
         return
+
+    if (loaded["tickers"] != live_tickers or loaded["main"] != main_ticker
+            or loaded["dividends"] != include_dividends):
+        st.caption("⚠️ Selection changed — click **Load & compare** to refresh the results below.")
+
+    all_tickers = loaded["tickers"]
+    main_ticker = loaded["main"]
+    include_dividends = loaded["dividends"]
 
     with st.spinner("Fetching price history…"):
         history = _fetch_perf_history(tuple(sorted(all_tickers)), auto_adjust=include_dividends)
