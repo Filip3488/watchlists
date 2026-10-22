@@ -147,6 +147,23 @@ def init_db():
         if "main_ticker" not in pp_cols:
             conn.execute("ALTER TABLE perf_presets ADD COLUMN main_ticker TEXT")
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tag_groups (
+                name     TEXT PRIMARY KEY,
+                position INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tag_group_map (
+                tag        TEXT PRIMARY KEY,
+                group_name TEXT NOT NULL
+            )
+            """
+        )
+
         # Seed defaults only if the DB is empty
         empty = conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0] == 0
         if empty:
@@ -293,6 +310,56 @@ def get_all_tags() -> list[str]:
     with get_conn() as conn:
         used = [r[0] for r in conn.execute("SELECT DISTINCT tag FROM stock_tags").fetchall()]
     return sorted(set(TAGS) | set(used))
+
+
+def get_tag_groups() -> list[str]:
+    with get_conn() as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT name FROM tag_groups ORDER BY COALESCE(position, 999), name"
+        ).fetchall()]
+
+
+def create_tag_group(name: str) -> bool:
+    try:
+        with get_conn() as conn:
+            next_pos = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM tag_groups"
+            ).fetchone()[0]
+            conn.execute("INSERT INTO tag_groups (name, position) VALUES (?, ?)", [name, next_pos])
+        return True
+    except duckdb.ConstraintException:
+        return False
+
+
+def delete_tag_group(name: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM tag_group_map WHERE group_name = ?", [name])
+        conn.execute("DELETE FROM tag_groups WHERE name = ?", [name])
+
+
+def rename_tag_group(old: str, new: str) -> bool:
+    try:
+        with get_conn() as conn:
+            conn.execute("UPDATE tag_group_map SET group_name = ? WHERE group_name = ?", [new, old])
+            conn.execute("UPDATE tag_groups SET name = ? WHERE name = ?", [new, old])
+        return True
+    except duckdb.ConstraintException:
+        return False
+
+
+def get_tag_group_map() -> dict[str, str]:
+    """Returns {tag: group_name} for all tags that have been assigned to a group."""
+    with get_conn() as conn:
+        return dict(conn.execute("SELECT tag, group_name FROM tag_group_map").fetchall())
+
+
+def set_tag_group(tag: str, group_name: str | None):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM tag_group_map WHERE tag = ?", [tag])
+        if group_name:
+            conn.execute(
+                "INSERT INTO tag_group_map (tag, group_name) VALUES (?, ?)", [tag, group_name]
+            )
 
 
 def get_ticker_meta() -> dict[str, tuple]:
@@ -1044,8 +1111,8 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
 def render_edit_screen(watchlists: dict[str, list[str]]):
     st.title("Edit watchlists")
 
-    tab_create, tab_rename, tab_reorder, tab_add, tab_status, tab_tags, tab_names, tab_del_item, tab_del_list = st.tabs(
-        ["Create list", "Rename list", "Reorder", "Add stock", "Set status", "Tags", "Names", "Remove stock", "Delete list"]
+    tab_create, tab_rename, tab_reorder, tab_add, tab_status, tab_tags, tab_tag_groups, tab_names, tab_del_item, tab_del_list = st.tabs(
+        ["Create list", "Rename list", "Reorder", "Add stock", "Set status", "Tags", "Tag Groups", "Names", "Remove stock", "Delete list"]
     )
 
     # ── Create a new watchlist ─────────────────────────────────────────────────
@@ -1218,6 +1285,80 @@ def render_edit_screen(watchlists: dict[str, list[str]]):
                     set_tags(tag_ticker, [])
                     st.success(f"Removed all tags from {tag_ticker}.")
                     st.rerun()
+
+    # ── Manage tag groups ──────────────────────────────────────────────────────
+    with tab_tag_groups:
+        with st.form("new_tag_group_form", clear_on_submit=True):
+            new_grp_name = st.text_input("New group name")
+            if st.form_submit_button("Create group", type="primary"):
+                name = new_grp_name.strip()
+                if not name:
+                    st.warning("Enter a name.")
+                elif create_tag_group(name):
+                    st.success(f"Created group \"{name}\".")
+                    st.rerun()
+                else:
+                    st.error(f"\"{name}\" already exists.")
+
+        groups = get_tag_groups()
+        all_tag_list = get_all_tags()
+
+        if groups:
+            with st.expander("Rename or delete a group"):
+                grp_sel = st.selectbox("Group", groups, key="tg_edit_group")
+                new_grp_nm = st.text_input("New name", value=grp_sel, key="tg_new_name")
+                if st.button("Rename", key="tg_rename"):
+                    clean = new_grp_nm.strip()
+                    if not clean:
+                        st.warning("Enter a name.")
+                    elif clean == grp_sel:
+                        st.info("Name unchanged.")
+                    elif rename_tag_group(grp_sel, clean):
+                        st.success(f"Renamed to \"{clean}\".")
+                        st.rerun()
+                    else:
+                        st.error(f"\"{clean}\" already exists.")
+                st.divider()
+                confirm_del = st.checkbox("Confirm deletion", key="tg_del_confirm")
+                if st.button("Delete group", type="primary", disabled=not confirm_del, key="tg_del"):
+                    delete_tag_group(grp_sel)
+                    st.success(f"Deleted \"{grp_sel}\".")
+                    st.rerun()
+
+        if not all_tag_list:
+            st.info("No tags defined yet. Assign tags to stocks first.")
+        elif not groups:
+            st.info("Create a group above to start assigning tags.")
+        else:
+            st.caption("Assign each tag to a group, or leave blank to keep it ungrouped.")
+            tg_map = get_tag_group_map()
+            tg_df = pd.DataFrame({
+                "Tag":   all_tag_list,
+                "Group": [tg_map.get(t, "") for t in all_tag_list],
+            })
+            edited_tg = st.data_editor(
+                tg_df,
+                hide_index=True,
+                use_container_width=True,
+                disabled=["Tag"],
+                column_config={
+                    "Tag":   st.column_config.TextColumn("Tag"),
+                    "Group": st.column_config.SelectboxColumn(
+                        "Group", options=[""] + groups,
+                        help="Assign to a group, or leave blank for ungrouped",
+                    ),
+                },
+                key="tag_group_editor",
+            )
+            if st.button("Save", type="primary", key="tg_save"):
+                changed = 0
+                for _, row in edited_tg.iterrows():
+                    new_g = (row["Group"] or "").strip()
+                    if new_g != tg_map.get(row["Tag"], ""):
+                        set_tag_group(row["Tag"], new_g or None)
+                        changed += 1
+                st.success(f"Saved {changed} change(s).")
+                st.rerun()
 
     # ── Maintain display names (and run the yfinance enrichment) ───────────────
     with tab_names:
@@ -1431,24 +1572,6 @@ def _point_cagr(series: pd.Series, years: int) -> float | None:
     return (p1 / p0) ** (1 / years) - 1
 
 
-def _endpoint_avg_cagr(series: pd.Series, years: int, win: int = 21) -> float | None:
-    """Endpoint-averaged CAGR: averages ~1 trading month around each endpoint so a
-    single freak price on the start or end day cannot dominate the result."""
-    if series.empty:
-        return None
-    end_date = series.index[-1]
-    target = end_date - pd.DateOffset(years=years)
-    if target < series.index[0]:
-        return None
-    end_avg = float(series.iloc[-win:].mean())
-    pos = series.index.get_indexer([pd.Timestamp(target)], method="nearest")[0]
-    lo, hi = max(0, pos - win // 2), min(len(series), pos + win // 2 + 1)
-    start_avg = float(series.iloc[lo:hi].mean())
-    if not start_avg or start_avg <= 0:
-        return None
-    return (end_avg / start_avg) ** (1 / years) - 1
-
-
 def _rolling_median_cagr(series: pd.Series, years: int) -> tuple[float | None, int]:
     """Median of the `years`-length CAGR computed from every monthly start date in
     history. Answers 'what was a typical N-year outcome?', independent of one lucky
@@ -1500,6 +1623,20 @@ def _avg_drawdown(series: pd.Series) -> float | None:
     return float(dd.mean())
 
 
+def _ulcer_index(series: pd.Series) -> float | None:
+    """Ulcer Index — root-mean-square of the drawdown series (each day's % below its
+    prior peak). Unlike max drawdown it reflects the depth AND duration of *every*
+    correction, so a stock that spends long stretches underwater scores high even if
+    its single worst drop was moderate. Positive; lower = shallower, briefer
+    drawdowns overall."""
+    if series is None or series.empty:
+        return None
+    dd = series / series.cummax() - 1.0
+    if dd.empty:
+        return None
+    return float(((dd ** 2).mean()) ** 0.5)
+
+
 def _annualized_vol(series: pd.Series) -> float | None:
     """Std dev of daily returns, annualized (×√252)."""
     if series.empty or len(series) < 2:
@@ -1508,6 +1645,73 @@ def _annualized_vol(series: pd.Series) -> float | None:
     if rets.empty:
         return None
     return float(rets.std() * (252 ** 0.5))
+
+
+def _k_ratio(series: pd.Series, years: int | None = None) -> float | None:
+    """Kestner (2013 revised) K-Ratio — how *consistent* the price trend is, not how
+    fast it rose. Regress cumulative log price on time and take
+    K = (slope / std-error-of-slope) × √252 / n. The √252/n scaling is length-
+    normalized, so stocks with different history lengths stay comparable. High K =
+    a steady, low-variance climb; near zero or negative = noisy, sideways or
+    falling. Uses the full available history by default, or the last `years` of
+    daily closes when `years` is given (falling back to full history when shorter)."""
+    import numpy as np
+    if series is None or series.empty:
+        return None
+    s = series
+    if years is not None:
+        end = series.index[-1]
+        s = series[series.index >= end - pd.DateOffset(years=years)]
+        if len(s) < 30:
+            s = series
+    s = s[s > 0]
+    if len(s) < 30:
+        return None
+    y = np.log(s.to_numpy(dtype=float))
+    n = len(y)
+    x = np.arange(n, dtype=float)
+    x_dev = x - x.mean()
+    ss_xx = float((x_dev ** 2).sum())
+    if ss_xx <= 0:
+        return None
+    slope = float((x_dev * (y - y.mean())).sum() / ss_xx)
+    resid = y - (y.mean() + slope * x_dev)
+    dof = n - 2
+    if dof <= 0:
+        return None
+    se_slope = float((resid @ resid / dof) ** 0.5 / (ss_xx ** 0.5))
+    if se_slope <= 0:
+        return None
+    return float((slope / se_slope) * (252.0 ** 0.5) / n)
+
+
+def _trend_resid_std(series: pd.Series) -> float | None:
+    """Scatter of price around its own log-price trend line — the 'noise' term that
+    K-Ratio divides out, shown on its own. Fits ln(price) vs time over the full
+    history and returns the residual std-dev as a multiplicative band (0.22 ≈ the
+    price typically sits within ±~22% of its trend, in either direction). Unlike
+    K-Ratio this is NOT inflated by a strong trend: a stock that swings widely around
+    its line scores high no matter how fast it climbs."""
+    import numpy as np
+    if series is None or series.empty:
+        return None
+    s = series[series > 0]
+    if len(s) < 30:
+        return None
+    y = np.log(s.to_numpy(dtype=float))
+    n = len(y)
+    x = np.arange(n, dtype=float)
+    x_dev = x - x.mean()
+    ss_xx = float((x_dev ** 2).sum())
+    if ss_xx <= 0:
+        return None
+    slope = float((x_dev * (y - y.mean())).sum() / ss_xx)
+    resid = y - (y.mean() + slope * x_dev)
+    dof = n - 2
+    if dof <= 0:
+        return None
+    sigma = float((resid @ resid / dof) ** 0.5)  # log units
+    return float(np.exp(sigma) - 1.0)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1549,150 +1753,6 @@ def _screen_candidates(region: str, min_mcap: float, sectors: tuple[str, ...], l
             break
     return out[:limit]
 
-
-
-import altair as alt
-
-
-@st.fragment
-def _perf_charts(df: pd.DataFrame, periods: list[str], main_ticker: str):
-    ctrl_col, lbl_col = st.columns([3, 1], vertical_alignment="bottom")
-    with ctrl_col:
-        period = st.radio("Period", periods, horizontal=True, key="perf_period_radio")
-    with lbl_col:
-        show_labels = st.toggle("Value labels", value=False)
-
-    chart_df = df[[period]].dropna().copy()
-    if chart_df.empty:
-        st.caption(f"No {period} data available for the selected stocks.")
-        return
-
-    chart_df[period] = chart_df[period] * 100
-    chart_df = chart_df.sort_values(period, ascending=False).reset_index()
-    chart_df["Sign"] = chart_df[period].map(
-        lambda x: "▲ Positive" if x >= 0 else "▼ Negative"
-    )
-    chart_df["Label"] = chart_df[period].map(lambda x: f"{x:+.1f}%")
-    chart_df["TickerLabel"] = chart_df["Ticker"].map(
-        lambda t: f"★ {t}" if t == main_ticker else t
-    )
-    ticker_order = chart_df["TickerLabel"].tolist()
-
-    bar_height = max(240, len(chart_df) * 56)
-    base = alt.Chart(chart_df).encode(
-        y=alt.Y(
-            "TickerLabel:N",
-            sort=ticker_order,
-            title=None,
-            axis=alt.Axis(labelFontSize=13, labelFontWeight=alt.ExprRef(
-                "indexof(datum.label, '★') >= 0 ? 'bold' : 'normal'"
-            )),
-        ),
-        x=alt.X(f"{period}:Q", title="Return (%)"),
-        color=alt.Color(
-            "Sign:N",
-            scale=alt.Scale(
-                domain=["▲ Positive", "▼ Negative"],
-                range=["#28a745", "#d9534f"],
-            ),
-            legend=alt.Legend(title=None, orient="top"),
-        ),
-        tooltip=[
-            alt.Tooltip("Ticker:N"),
-            alt.Tooltip(f"{period}:Q", format="+.2f", title="Return (%)"),
-        ],
-    )
-
-    bars = base.mark_bar(cornerRadiusEnd=4).properties(height=bar_height)
-
-    zero_rule = (
-        alt.Chart(pd.DataFrame({"x": [0]}))
-        .mark_rule(color="#888", strokeDash=[4, 4], strokeWidth=1.5)
-        .encode(x="x:Q")
-    )
-
-    if show_labels:
-        labels_pos = base.mark_text(
-            align="left", dx=5, fontSize=11, fontWeight="bold", color="#333",
-        ).encode(
-            text="Label:N",
-            x=alt.X(f"{period}:Q"),
-        ).transform_filter(
-            alt.datum[period] >= 0
-        ).properties(height=bar_height)
-        labels_neg = base.mark_text(
-            align="right", dx=-5, fontSize=11, fontWeight="bold", color="#333",
-        ).encode(
-            text="Label:N",
-            x=alt.X(f"{period}:Q"),
-        ).transform_filter(
-            alt.datum[period] < 0
-        ).properties(height=bar_height)
-        st.altair_chart(bars + zero_rule + labels_pos + labels_neg, use_container_width=True)
-    else:
-        st.altair_chart(bars + zero_rule, use_container_width=True)
-
-
-@st.fragment
-def _cagr_methods(history: dict, name_map: dict, main_ticker: str, all_tickers: list[str]):
-    """Compare three ways of computing CAGR side by side for one window, so the
-    start-date sensitivity of each method is visible at a glance."""
-    window = st.radio("Window", ["5Y", "10Y", "15Y"], index=1, horizontal=True, key="cagr_method_window")
-    years = int(window[:-1])
-    methods = ["Point-to-point", "Endpoint-avg", "Rolling median"]
-
-    rows = []
-    for t in all_tickers:
-        s = history.get(t)
-        if s is None or s.empty:
-            vals = {m: None for m in methods}
-            n_windows, since = 0, None
-        else:
-            roll_median, n_windows = _rolling_median_cagr(s, years)
-            vals = {
-                "Point-to-point": _point_cagr(s, years),
-                "Endpoint-avg":   _endpoint_avg_cagr(s, years),
-                "Rolling median": roll_median,
-            }
-            since = s.index[0]
-        rows.append({
-            "Ticker": t, "Name": name_map.get(t, t), **vals,
-            "Rolling n": n_windows,
-            "Data since": since.strftime("%Y-%m-%d") if since is not None else "—",
-        })
-
-    mdf = pd.DataFrame(rows)
-    mdf = mdf.sort_values("Rolling median", ascending=False, na_position="last")
-
-    def _fmt(val):
-        return "N/A" if pd.isna(val) else f"{val * 100:+.2f}%"
-
-    def _cell_color(val):
-        if pd.isna(val):
-            return "color: #999"
-        return f"color: {'#28a745' if val >= 0 else '#d9534f'}; font-weight: bold"
-
-    def _row_highlight(row):
-        if row.get("Ticker") == main_ticker:
-            return ["background-color: #fff8e1"] * len(row)
-        return [""] * len(row)
-
-    styled = (
-        mdf[["Ticker", "Name"] + methods + ["Rolling n", "Data since"]]
-        .style
-        .apply(_row_highlight, axis=1)
-        .map(_cell_color, subset=methods)
-        .format(_fmt, subset=methods, na_rep="N/A")
-        .hide(axis="index")
-    )
-    st.dataframe(styled, use_container_width=True)
-    st.caption(
-        "All methods use daily closing prices. "
-        "**Point-to-point**: last close vs the close exactly N years ago (one start date). "
-        "**Endpoint-avg**: averages ~21 daily closes around each endpoint. "
-        "**Rolling median**: median N-year CAGR over every **month-end** start date in history "
-        "(**Rolling n** = how many such windows existed; **Data since** = oldest price available)."
-    )
 
 
 @st.fragment
@@ -1742,6 +1802,13 @@ def _rebased_chart(history: dict, main_ticker: str, all_tickers: list[str]):
     st.plotly_chart(fig, use_container_width=True)
 
 
+# Soft pastel row backgrounds, one per watchlist loaded into the comparison
+_WL_ROW_PALETTE = [
+    "#dbeafe", "#dcfce7", "#fce7f3", "#ffedd5",
+    "#e0e7ff", "#d1fae5", "#fee2e2", "#f3e8ff",
+]
+
+
 def render_performance_page():
     st.title("📊 Performance Comparison")
 
@@ -1782,6 +1849,7 @@ def render_performance_page():
                 if len(valid) < len(p["tickers"]):
                     missing = set(p["tickers"]) - set(valid)
                     st.warning(f"Skipped {len(missing)} ticker(s) no longer in your watchlists: {', '.join(sorted(missing))}")
+                st.session_state.pop("perf_ticker_source", None)
                 st.rerun()
         with del_col:
             if st.button("🗑️", use_container_width=True, disabled=not preset_choice, help="Delete this preset"):
@@ -1798,6 +1866,63 @@ def render_performance_page():
             if st.button("Save", use_container_width=True, disabled=not (new_name.strip() and current_tickers)):
                 save_perf_preset(new_name.strip(), current_tickers)
                 st.success(f'Saved preset "{new_name.strip()}".')
+                st.rerun()
+
+    # ── Load tickers from watchlist(s) ───────────────────────────────────────
+    watchlists_data = get_watchlists()
+    if watchlists_data:
+        with st.expander("📋 Load tickers from watchlist(s)"):
+            wl_pick = st.multiselect(
+                "Watchlists",
+                options=list(watchlists_data.keys()),
+                placeholder="Choose one or more watchlists…",
+                key="perf_wl_pick",
+                label_visibility="collapsed",
+            )
+            if st.button("Load tickers", disabled=not wl_pick, key="perf_load_wl"):
+                _src = dict(st.session_state.get("perf_ticker_source", {}))
+                _cur = list(st.session_state.get("perf_compare_tickers", []))
+                _cur_set = set(_cur)
+                for wl in wl_pick:
+                    for t in watchlists_data.get(wl, []):
+                        if t in name_map:
+                            if t not in _src:
+                                _src[t] = wl
+                            if t not in _cur_set:
+                                _cur.append(t)
+                                _cur_set.add(t)
+                st.session_state["perf_compare_tickers"] = _cur
+                st.session_state["perf_ticker_source"] = _src
+                st.rerun()
+
+    # ── Load tickers from tag(s) ──────────────────────────────────────────────
+    with st.expander("🏷️ Load tickers from tag(s)"):
+        _all_tags = get_all_tags()
+        if not _all_tags:
+            st.caption("No tags defined yet.")
+        else:
+            tag_pick = st.multiselect(
+                "Tags",
+                options=_all_tags,
+                placeholder="Choose one or more tags…",
+                key="perf_tag_pick",
+                label_visibility="collapsed",
+            )
+            if st.button("Load tickers", disabled=not tag_pick, key="perf_load_tags"):
+                _tags_map = get_tags_map()
+                _src = dict(st.session_state.get("perf_ticker_source", {}))
+                _cur = list(st.session_state.get("perf_compare_tickers", []))
+                _cur_set = set(_cur)
+                for tag in tag_pick:
+                    for t, t_tags in _tags_map.items():
+                        if tag in t_tags and t in name_map:
+                            if t not in _src:
+                                _src[t] = tag
+                            if t not in _cur_set:
+                                _cur.append(t)
+                                _cur_set.add(t)
+                st.session_state["perf_compare_tickers"] = _cur
+                st.session_state["perf_ticker_source"] = _src
                 st.rerun()
 
     # ── Main stock + comparison selectors ─────────────────────────────────────
@@ -1860,6 +1985,74 @@ def render_performance_page():
         st.error("Could not fetch price data — please try again.")
         return
 
+    # ── Row coloring ──────────────────────────────────────────────────────────
+    color_by = st.radio(
+        "Color rows by:",
+        options=["None", "Watchlist", "Watchlist type", "Tag group"],
+        horizontal=True,
+        key="perf_color_by",
+    )
+    wl_bg: dict[str, str] = {}
+    ticker_bg: dict[str, str] = {}
+
+    if color_by == "Watchlist":
+        _wls = get_watchlists()
+        _seen_wl: set[str] = set()
+        _ordered_wls: list[str] = []
+        _t_wl: dict[str, str] = {}
+        for wl_name, wl_tickers in _wls.items():
+            for t in wl_tickers:
+                if t in all_tickers and t not in _t_wl:
+                    _t_wl[t] = wl_name
+                    if wl_name not in _seen_wl:
+                        _seen_wl.add(wl_name)
+                        _ordered_wls.append(wl_name)
+        wl_bg = {n: _WL_ROW_PALETTE[i % len(_WL_ROW_PALETTE)] for i, n in enumerate(_ordered_wls)}
+        ticker_bg = {t: wl_bg[wl] for t, wl in _t_wl.items()}
+
+    elif color_by == "Watchlist type":
+        _STATUS_BG = {"active": "#d4edda", "target": "#dbeafe", "info": "#e9ecef"}
+        _STATUS_LEGEND = {"active": "🟢 Held", "target": "🎯 Target", "info": "ℹ️ Info"}
+        _wls = get_watchlists()
+        _statuses = get_watchlist_statuses()
+        _t_status: dict[str, str] = {}
+        for wl_name, wl_tickers in _wls.items():
+            s = _statuses.get(wl_name, "target")
+            for t in wl_tickers:
+                if t in all_tickers and t not in _t_status:
+                    _t_status[t] = s
+        present = [s for s in STATUS_OPTIONS if any(v == s for v in _t_status.values())]
+        wl_bg = {_STATUS_LEGEND[s]: _STATUS_BG[s] for s in present}
+        ticker_bg = {t: _STATUS_BG[s] for t, s in _t_status.items()}
+
+    elif color_by == "Tag group":
+        _groups = get_tag_groups()
+        if not _groups:
+            st.caption("No tag groups defined yet — create some in Settings → Edit Watchlists → Tag Groups.")
+        else:
+            _sel_grp = st.selectbox(
+                "Tag group",
+                options=_groups,
+                key="perf_color_tag_group",
+                label_visibility="collapsed",
+            )
+            _tg_map = get_tag_group_map()
+            _tags_in_grp = sorted(tag for tag, grp in _tg_map.items() if grp == _sel_grp)
+            _tags_m = get_tags_map()
+            _t_tag: dict[str, str] = {}
+            _tag_order: list[str] = []
+            _seen_tags: set[str] = set()
+            for t in all_tickers:
+                for tag in _tags_m.get(t, []):
+                    if tag in _tags_in_grp:
+                        _t_tag[t] = tag
+                        if tag not in _seen_tags:
+                            _seen_tags.add(tag)
+                            _tag_order.append(tag)
+                        break
+            wl_bg = {tag: _WL_ROW_PALETTE[i % len(_WL_ROW_PALETTE)] for i, tag in enumerate(_tag_order)}
+            ticker_bg = {t: wl_bg[tag] for t, tag in _t_tag.items()}
+
     # ── Build metrics DataFrame ───────────────────────────────────────────────
     PERIODS = ["YTD", "1Y", "5Y CAGR", "10Y CAGR", "15Y CAGR"]
     records = []
@@ -1874,8 +2067,23 @@ def render_performance_page():
 
     df = pd.DataFrame(records).set_index("Ticker")
 
-    # ── Styled returns table ──────────────────────────────────────────────────
-    st.subheader("Returns")
+    # ── Point-to-point CAGR table ─────────────────────────────────────────────
+    if wl_bg:
+        _mode_label = {
+            "Watchlist": "watchlist", "Watchlist type": "watchlist type", "Tag group": "tag group",
+        }.get(color_by, "")
+        chips = "".join(
+            f'<span style="display:inline-block; background:{color}; border:1px solid #c0c8d8; '
+            f'border-radius:8px; padding:2px 10px; margin:2px 4px; font-size:.82em; '
+            f'font-weight:600; color:#1a1a2e">{name}</span>'
+            for name, color in wl_bg.items()
+        )
+        st.markdown(
+            f'<div style="margin-bottom:4px; font-size:.85em; color:#555">'
+            f'Color by {_mode_label}: {chips}</div>',
+            unsafe_allow_html=True,
+        )
+    st.subheader("Point-to-point CAGR")
 
     def _fmt(val):
         return "N/A" if pd.isna(val) else f"{val * 100:+.2f}%"
@@ -1888,9 +2096,14 @@ def render_performance_page():
     def _row_highlight(row):
         if row.get("Ticker") == main_ticker:
             return ["background-color: #fff8e1"] * len(row)
-        return [""] * len(row)
+        bg = ticker_bg.get(row.get("Ticker"), "")
+        return [f"background-color: {bg}" if bg else ""] * len(row)
 
-    display_df = df[["Name"] + PERIODS].reset_index()
+    display_df = (
+        df[["Name"] + PERIODS]
+        .reset_index()
+        .sort_values("10Y CAGR", ascending=False, na_position="last")
+    )
     styled = (
         display_df
         .style
@@ -1899,34 +2112,118 @@ def render_performance_page():
         .format(_fmt, subset=PERIODS, na_rep="N/A")
         .hide(axis="index")
     )
-    st.dataframe(styled, use_container_width=True)
+    st.dataframe(styled, use_container_width=True,
+                 height=(min(len(display_df), 50) + 1) * 35 + 3)
+    st.caption(
+        "Plain point-to-point CAGR: latest close vs the close exactly that many "
+        "years ago (YTD and 1Y are simple returns). One start date, so sensitive "
+        "to where the window happens to begin — the table below smooths that out."
+    )
 
-    # ── Rank table (main stock only) ──────────────────────────────────────────
-    if main_ticker and main_ticker in df.index:
-        st.subheader(f"Rank — {main_ticker}")
-        rank_row = {}
-        for period in PERIODS:
-            vals = df[period].dropna()
-            main_val = df.loc[main_ticker, period] if main_ticker in vals.index else None
-            if main_val is not None and not pd.isna(main_val):
-                rank = int((vals > main_val).sum()) + 1
-                rank_row[period] = f"{rank} / {len(vals)}"
-            else:
-                rank_row[period] = "N/A"
-        rank_df = pd.DataFrame([rank_row], index=[main_ticker])
-        st.dataframe(rank_df, use_container_width=True)
+    # ── Trend & consistency table ─────────────────────────────────────────────
+    st.subheader("Trend & consistency")
+    trend_rows = []
+    for ticker in all_tickers:
+        s = history.get(ticker)
+        if s is None or s.empty:
+            roll5 = roll10 = roll15 = ratio3 = ratio5 = kr = tdev = ulcer = None
+            n5 = n10 = n15 = 0
+            since = None
+        else:
+            roll5, n5 = _rolling_median_cagr(s, 5)
+            roll10, n10 = _rolling_median_cagr(s, 10)
+            roll15, n15 = _rolling_median_cagr(s, 15)
+            denom_ok = roll10 is not None and roll10 > 0
+            p3 = _point_cagr(s, 3)
+            p5 = _point_cagr(s, 5)
+            ratio3 = (p3 / roll10) if (p3 is not None and denom_ok) else None
+            ratio5 = (p5 / roll10) if (p5 is not None and denom_ok) else None
+            kr = _k_ratio(s)
+            tdev = _trend_resid_std(s)
+            ulcer = _ulcer_index(s)
+            since = s.index[0]
+        trend_rows.append({
+            "Ticker": ticker, "Name": name_map.get(ticker, ticker),
+            "Rolling 5Y CAGR": roll5, "Rolling 10Y CAGR": roll10, "Rolling 15Y CAGR": roll15,
+            "3Y/10Y Ratio": ratio3, "5Y/10Y Ratio": ratio5,
+            "K-Ratio": kr, "Trend dev": tdev, "Ulcer": ulcer,
+            "5Y n": n5, "10Y n": n10, "15Y n": n15,
+            "Data since": since.strftime("%Y-%m-%d") if since is not None else "—",
+        })
+    rolling_cols = ["Rolling 5Y CAGR", "Rolling 10Y CAGR", "Rolling 15Y CAGR"]
+    ratio_cols = ["3Y/10Y Ratio", "5Y/10Y Ratio"]
+    risk_cols = ["Trend dev", "Ulcer"]
+    n_cols = ["5Y n", "10Y n", "15Y n"]
+    col_order = [
+        "Ticker", "Name",
+        "Rolling 5Y CAGR", "5Y n",
+        "Rolling 10Y CAGR", "10Y n",
+        "Rolling 15Y CAGR", "15Y n",
+        "3Y/10Y Ratio", "5Y/10Y Ratio",
+        "K-Ratio", "Trend dev", "Ulcer",
+        "Data since",
+    ]
+    trend_df = (
+        pd.DataFrame(trend_rows)[col_order]
+        .sort_values("Rolling 10Y CAGR", ascending=False, na_position="last")
+    )
 
-    # ── CAGR method comparison ────────────────────────────────────────────────
-    st.subheader("CAGR method comparison")
-    _cagr_methods(history, name_map, main_ticker, all_tickers)
+    def _fmt_ratio(val):
+        return "N/A" if pd.isna(val) else f"{val:.2f}×"
+
+    def _fmt_num(val):
+        return "N/A" if pd.isna(val) else f"{val:.2f}"
+
+    def _fmt_pct_plain(val):
+        return "N/A" if pd.isna(val) else f"{val * 100:.1f}%"
+
+    def _color_ratio(val):
+        if pd.isna(val):
+            return "color: #999"
+        return f"color: {'#28a745' if val >= 1 else '#d9534f'}; font-weight: bold"
+
+    def _color_risk(val):
+        return "color: #999" if pd.isna(val) else "color: #d9534f"
+
+    trend_styled = (
+        trend_df
+        .style
+        .apply(_row_highlight, axis=1)
+        .map(_cell_color, subset=rolling_cols)
+        .map(_color_ratio, subset=ratio_cols)
+        .map(_cell_color, subset=["K-Ratio"])
+        .map(_color_risk, subset=risk_cols)
+        .format(_fmt, subset=rolling_cols, na_rep="N/A")
+        .format(_fmt_ratio, subset=ratio_cols, na_rep="N/A")
+        .format(_fmt_num, subset=["K-Ratio"], na_rep="N/A")
+        .format(_fmt_pct_plain, subset=risk_cols, na_rep="N/A")
+        .format("{:d}", subset=n_cols)
+        .hide(axis="index")
+    )
+    st.dataframe(trend_styled, use_container_width=True,
+                 height=(min(len(trend_df), 50) + 1) * 35 + 3)
+    st.caption("\n".join([
+        "- **Rolling 5Y / 10Y / 15Y CAGR** — median CAGR over every month-end start date "
+        "for that window length, so each reflects a *typical* period rather than one lucky "
+        "or unlucky start.",
+        "- **5Y n / 10Y n / 15Y n** — how many such windows existed in the available history "
+        "(more = a more reliable median).",
+        "- **3Y/10Y** and **5Y/10Y Ratio** — the last 3-year resp. 5-year (point-to-point) "
+        "CAGR ÷ the rolling 10Y median: >1.00× means recent growth is running above its "
+        "long-run norm, <1.00× below (shown only when the 10Y median is positive).",
+        "- **K-Ratio** — Kestner (2013) trend *strength*: log price regressed on time over the "
+        "**full** history, length-normalized, so higher = a cleaner, more dominant trend.",
+        "- **Trend dev** — the scatter K-Ratio divides out: how far price typically sits from "
+        "its own trend line, up or down (±% band); high = a bumpy ride regardless of trend "
+        "strength.",
+        "- **Ulcer** — root-mean-square of all drawdowns (depth *and* time spent underwater), "
+        "so it reflects regular corrections, not just the single worst.",
+        "- **Data since** — first date of available price history.",
+    ]))
 
     # ── Indexed growth (rebased to 100) ───────────────────────────────────────
     st.subheader("Indexed growth (rebased to 100)")
     _rebased_chart(history, main_ticker, all_tickers)
-
-    # ── Bar charts (one tab per period) ───────────────────────────────────────
-    st.subheader("Chart")
-    _perf_charts(df, PERIODS, main_ticker)
 
 
 SCREENER_REGIONS = ["us", "de", "gb", "fr", "nl", "ch", "ca", "jp", "hk", "au", "it", "es", "se"]
@@ -1989,6 +2286,7 @@ def _search_results(mdf: pd.DataFrame):
     )
     st.dataframe(
         styled, use_container_width=True,
+        height=(min(len(disp), 50) + 1) * 35 + 3,
         column_config={
             "Ticker": st.column_config.LinkColumn(
                 "Ticker", display_text=r"yfsym=(.+)$", help="Open chart on TradingView ↗"
@@ -2076,6 +2374,10 @@ def render_search_page():
 
     st.divider()
     _search_results(mdf)
+
+
+def render_color_settings_page():
+    pass
 
 
 # ── Navigation (native sidebar menu) ───────────────────────────────────────────
