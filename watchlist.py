@@ -1759,17 +1759,16 @@ def _screen_candidates(region: str, min_mcap: float, sectors: tuple[str, ...], l
 def _rebased_chart(history: dict, main_ticker: str, all_tickers: list[str]):
     """Indexed growth: every stock rebased to 100 at the start of the chosen window,
     on a log axis so equal % moves are equal visual distances and the whole path —
-    not just the two endpoints — is visible. Plotly so it zooms/pans."""
-    import plotly.graph_objects as go
-
+    not just the two endpoints — is visible. Plotly so it zooms/pans; falls back to
+    a native line chart if plotly isn't installed in the runtime."""
     period = st.radio(
         "Period", ["1Y", "5Y CAGR", "10Y CAGR", "15Y CAGR"],
         horizontal=True, key="rebase_period",
         format_func=lambda p: p.replace(" CAGR", ""),
     )
 
-    fig = go.Figure()
-    plotted = 0
+    # Rebase each series to 100 at the start of the chosen window.
+    rebased: dict[str, pd.Series] = {}
     for t in all_tickers:
         s = history.get(t)
         if s is None or s.empty:
@@ -1778,18 +1777,31 @@ def _rebased_chart(history: dict, main_ticker: str, all_tickers: list[str]):
         s2 = s[s.index >= start]
         if s2.empty or float(s2.iloc[0]) <= 0:
             continue
-        rb = s2 / float(s2.iloc[0]) * 100
+        rebased[t] = s2 / float(s2.iloc[0]) * 100
+
+    if not rebased:
+        st.caption("No data available for the selected period.")
+        return
+
+    try:
+        import plotly.graph_objects as go
+    except ModuleNotFoundError:
+        # Fallback: native line chart (no log axis / per-line styling, but no extra dep).
+        st.line_chart(pd.DataFrame(rebased), height=440)
+        st.caption(
+            "Growth rebased to 100 (linear axis). Install `plotly` for the "
+            "interactive log-scale chart."
+        )
+        return
+
+    fig = go.Figure()
+    for t, rb in rebased.items():
         is_main = t == main_ticker
         fig.add_trace(go.Scatter(
             x=rb.index, y=rb.values, name=t, mode="lines",
             line=dict(width=3.5 if is_main else 1.5),
             hovertemplate=f"<b>{t}</b><br>%{{x|%Y-%m-%d}}<br>Index: %{{y:.1f}}<extra></extra>",
         ))
-        plotted += 1
-
-    if plotted == 0:
-        st.caption("No data available for the selected period.")
-        return
 
     fig.update_yaxes(type="log", title="Growth (start = 100)")
     fig.update_xaxes(title=None)
@@ -1826,6 +1838,8 @@ def render_performance_page():
         return
 
     name_map = {t: name for t, name in rows}
+    _meta = get_ticker_meta()
+    ex_map = {t: (_meta.get(t) or ("", "", ""))[1] or "" for t in name_map}
 
     # ── Preset loader ─────────────────────────────────────────────────────────
     presets = get_perf_presets()
@@ -2094,15 +2108,29 @@ def render_performance_page():
         return f"color: {'#28a745' if val >= 0 else '#d9534f'}; font-weight: bold"
 
     def _row_highlight(row):
-        if row.get("Ticker") == main_ticker:
+        t = row.name  # DataFrame index = the real ticker
+        if t == main_ticker:
             return ["background-color: #fff8e1"] * len(row)
-        bg = ticker_bg.get(row.get("Ticker"), "")
+        bg = ticker_bg.get(t, "")
         return [f"background-color: {bg}" if bg else ""] * len(row)
+
+    _link_cfg = {
+        "Ticker": st.column_config.LinkColumn(
+            "Ticker", display_text=r"yfsym=(.+)$", help="Open chart on TradingView ↗"
+        ),
+    }
 
     display_df = (
         df[["Name"] + PERIODS]
-        .reset_index()
         .sort_values("10Y CAGR", ascending=False, na_position="last")
+        .copy()
+    )
+    # Index stays the real ticker (used for row highlighting); the visible Ticker
+    # column holds a TradingView URL with the real symbol appended as a query param
+    # so the LinkColumn's regex can show it as the label.
+    display_df.insert(
+        0, "Ticker",
+        [f"{tradingview_url(t, ex_map.get(t, ''))}&yfsym={t}" for t in display_df.index],
     )
     styled = (
         display_df
@@ -2113,7 +2141,8 @@ def render_performance_page():
         .hide(axis="index")
     )
     st.dataframe(styled, use_container_width=True,
-                 height=(min(len(display_df), 50) + 1) * 35 + 3)
+                 height=(min(len(display_df), 50) + 1) * 35 + 3,
+                 column_config=_link_cfg)
     st.caption(
         "Plain point-to-point CAGR: latest close vs the close exactly that many "
         "years ago (YTD and 1Y are simple returns). One start date, so sensitive "
@@ -2164,9 +2193,16 @@ def render_performance_page():
         "Data since",
     ]
     trend_df = (
-        pd.DataFrame(trend_rows)[col_order]
+        pd.DataFrame(trend_rows)
         .sort_values("Rolling 10Y CAGR", ascending=False, na_position="last")
+        .set_index("Ticker", drop=False)
     )
+    # Visible Ticker column → TradingView link; the index keeps the real symbol for
+    # row highlighting (and the display_text regex reads the appended yfsym param).
+    trend_df["Ticker"] = [
+        f"{tradingview_url(t, ex_map.get(t, ''))}&yfsym={t}" for t in trend_df.index
+    ]
+    trend_df = trend_df[col_order]
 
     def _fmt_ratio(val):
         return "N/A" if pd.isna(val) else f"{val:.2f}×"
@@ -2201,7 +2237,8 @@ def render_performance_page():
         .hide(axis="index")
     )
     st.dataframe(trend_styled, use_container_width=True,
-                 height=(min(len(trend_df), 50) + 1) * 35 + 3)
+                 height=(min(len(trend_df), 50) + 1) * 35 + 3,
+                 column_config=_link_cfg)
     st.caption("\n".join([
         "- **Rolling 5Y / 10Y / 15Y CAGR** — median CAGR over every month-end start date "
         "for that window length, so each reflects a *typical* period rather than one lucky "
