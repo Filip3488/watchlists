@@ -5,6 +5,7 @@ import duckdb
 import os
 import re
 import html
+import json
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -50,6 +51,9 @@ DEFAULT_WATCHLISTS = {
 }
 
 TAGS = ["Sell", "Stock up", "Monitor"]
+
+# Level types for the per-stock price-level tracker (Analysis → Levels)
+LEVEL_TYPES = ["Support", "Resistance", "Buy target", "Sell target", "Stop-loss"]
 
 
 # ── Database (MotherDuck) ───────────────────────────────────────────────────────
@@ -107,6 +111,40 @@ def init_db():
             )
             """
         )
+        conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_stock_levels START 1")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_levels (
+                id         INTEGER PRIMARY KEY DEFAULT nextval('seq_stock_levels'),
+                ticker     TEXT    NOT NULL,
+                price      DOUBLE  NOT NULL,
+                level_type TEXT    NOT NULL DEFAULT 'Support',
+                note       TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_notes (
+                ticker TEXT PRIMARY KEY,
+                note   TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS level_types (
+                name     TEXT PRIMARY KEY,
+                position INTEGER
+            )
+            """
+        )
+        # Seed the level types with the defaults the first time only.
+        if conn.execute("SELECT COUNT(*) FROM level_types").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO level_types (name, position) VALUES (?, ?)",
+                [(name, pos) for pos, name in enumerate(LEVEL_TYPES)],
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ticker_names (
@@ -146,6 +184,17 @@ def init_db():
         pp_cols = [r[1] for r in conn.execute("PRAGMA table_info('perf_presets')").fetchall()]
         if "main_ticker" not in pp_cols:
             conn.execute("ALTER TABLE perf_presets ADD COLUMN main_ticker TEXT")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS filter_presets (
+                scope    TEXT NOT NULL,
+                name     TEXT NOT NULL,
+                settings TEXT NOT NULL,
+                PRIMARY KEY (scope, name)
+            )
+            """
+        )
 
         conn.execute(
             """
@@ -310,6 +359,106 @@ def get_all_tags() -> list[str]:
     with get_conn() as conn:
         used = [r[0] for r in conn.execute("SELECT DISTINCT tag FROM stock_tags").fetchall()]
     return sorted(set(TAGS) | set(used))
+
+
+# ── Stock price levels & per-stock notes ────────────────────────────────────────
+def get_levels(ticker: str) -> list[dict]:
+    """Price levels recorded for one ticker, ordered by price."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, price, level_type, note FROM stock_levels "
+            "WHERE ticker = ? ORDER BY price",
+            [ticker],
+        ).fetchall()
+    return [
+        {"id": r[0], "price": r[1], "level_type": r[2], "note": r[3] or ""}
+        for r in rows
+    ]
+
+
+def get_levels_map() -> dict[str, list[dict]]:
+    """All price levels grouped by ticker (for watchlist/monitor overlays)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT ticker, id, price, level_type, note FROM stock_levels "
+            "ORDER BY ticker, price"
+        ).fetchall()
+    result: dict[str, list[dict]] = {}
+    for ticker, _id, price, level_type, note in rows:
+        result.setdefault(ticker, []).append(
+            {"id": _id, "price": price, "level_type": level_type, "note": note or ""}
+        )
+    return result
+
+
+def replace_levels(ticker: str, levels: list[dict]):
+    """Replace the full set of price levels for a ticker."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM stock_levels WHERE ticker = ?", [ticker])
+        if levels:
+            conn.executemany(
+                "INSERT INTO stock_levels (ticker, price, level_type, note) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (ticker, lv["price"], lv["level_type"], lv.get("note") or None)
+                    for lv in levels
+                ],
+            )
+
+
+def get_stock_note(ticker: str) -> str:
+    """The free-text general comment for a ticker ("" if none)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT note FROM stock_notes WHERE ticker = ?", [ticker]
+        ).fetchone()
+    return (row[0] if row else "") or ""
+
+
+def get_stock_notes_map() -> dict[str, str]:
+    """All per-stock general comments keyed by ticker (blank notes excluded)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT ticker, note FROM stock_notes ORDER BY ticker"
+        ).fetchall()
+    return {t: n for t, n in rows if (n or "").strip()}
+
+
+def get_level_types() -> list[str]:
+    """The user-maintained list of level types (falls back to defaults if empty)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT name FROM level_types ORDER BY COALESCE(position, 999), name"
+        ).fetchall()
+    return [r[0] for r in rows] or list(LEVEL_TYPES)
+
+
+def set_level_types(names: list[str]):
+    """Replace the full set of level types, preserving the given order."""
+    seen, ordered = set(), []
+    for n in names:
+        n = (n or "").strip()
+        if n and n not in seen:
+            seen.add(n)
+            ordered.append(n)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM level_types")
+        if ordered:
+            conn.executemany(
+                "INSERT INTO level_types (name, position) VALUES (?, ?)",
+                [(n, pos) for pos, n in enumerate(ordered)],
+            )
+
+
+def set_stock_note(ticker: str, note: str):
+    """Upsert the general comment for a ticker; blank removes it."""
+    note = (note or "").strip()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM stock_notes WHERE ticker = ?", [ticker])
+        if note:
+            conn.execute(
+                "INSERT INTO stock_notes (ticker, note) VALUES (?, ?)", [ticker, note]
+            )
 
 
 def get_tag_groups() -> list[str]:
@@ -859,6 +1008,90 @@ def render_quote_table(frame: pd.DataFrame, tags_map: dict[str, list[str]],
                          height=height, hide_index=True)
 
 
+# ── Filter-preset session helpers ───────────────────────────────────────────────
+def _filter_state_keys(selected_list: str) -> list[str]:
+    """The session_state keys that make up the filter/grouping configuration for a
+    monitor view. Status- and watchlist-filtering only exist on the aggregate All
+    view, so those keys are only included there."""
+    keys = [
+        f"only_today::{selected_list}",
+        f"grouptype::{selected_list}",
+        f"groupwl::{selected_list}",
+        f"groupby::{selected_list}",
+        f"wlfilter::{selected_list}",
+        f"tagfilter::{selected_list}",
+    ]
+    if selected_list == ALL_LABEL:
+        keys.append("list_status_filter")
+    return keys
+
+
+def _collect_filter_settings(selected_list: str) -> dict:
+    """Snapshot the current filter values from session_state (last committed by the
+    widgets on the previous run)."""
+    return {
+        k: st.session_state[k]
+        for k in _filter_state_keys(selected_list)
+        if k in st.session_state
+    }
+
+
+def _apply_filter_settings(selected_list: str, settings: dict):
+    """Write saved filter values back into session_state. Must run before the filter
+    widgets are instantiated (Streamlit forbids changing a widget's key after it is
+    created), so the caller writes then st.rerun()s."""
+    valid = set(_filter_state_keys(selected_list))
+    for k, v in settings.items():
+        if k in valid:
+            st.session_state[k] = v
+
+
+def _render_filter_presets(selected_list: str):
+    """Save / load / delete bar for the current view's filter configuration. Rendered
+    after the per-list setdefaults and before the filter widgets so a loaded preset
+    is picked up by the widgets on the rerun."""
+    presets = get_filter_presets(selected_list)
+    if presets:
+        p_col, load_col, del_col = st.columns([4, 1.4, 0.7])
+        with p_col:
+            choice = st.selectbox(
+                "Filter preset",
+                options=[""] + list(presets.keys()),
+                format_func=lambda x: "— saved filter presets —" if x == "" else x,
+                key=f"filter_preset_choice::{selected_list}",
+                label_visibility="collapsed",
+            )
+        with load_col:
+            if st.button("⬇ Load filters", use_container_width=True,
+                         disabled=not choice, key=f"filter_preset_load::{selected_list}"):
+                _apply_filter_settings(selected_list, presets[choice])
+                st.rerun()
+        with del_col:
+            if st.button("🗑️", use_container_width=True, disabled=not choice,
+                         help="Delete this filter preset",
+                         key=f"filter_preset_del::{selected_list}"):
+                delete_filter_preset(selected_list, choice)
+                st.rerun()
+
+    with st.expander("💾 Save current filters as preset"):
+        s_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
+        with s_col:
+            new_name = st.text_input(
+                "Preset name", placeholder="e.g. Held, grouped by watchlist",
+                key=f"filter_preset_name::{selected_list}",
+            )
+        with btn_col:
+            if st.button("Save", use_container_width=True,
+                         disabled=not new_name.strip(),
+                         key=f"filter_preset_save::{selected_list}"):
+                save_filter_preset(
+                    selected_list, new_name.strip(),
+                    _collect_filter_settings(selected_list),
+                )
+                st.success(f'Saved filter preset "{new_name.strip()}".')
+                st.rerun()
+
+
 def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
     if selected_list == ALL_LABEL:
         seen = set()
@@ -905,6 +1138,10 @@ def render_monitor(selected_list: str, watchlists: dict[str, list[str]]):
     st.session_state.setdefault(f"groupwl::{selected_list}", selected_list == ALL_LABEL)
     if selected_list == ALL_LABEL:
         st.session_state.setdefault("list_status_filter", ["🟢 Held"])
+
+    # Save/load the current filter configuration. Rendered before the filter widgets
+    # so a loaded preset's values are in session_state when the widgets read them.
+    _render_filter_presets(selected_list)
 
     # The three groupings are mutually exclusive — turning one on turns the others off
     tag_key = f"groupby::{selected_list}"
@@ -1496,6 +1733,41 @@ def save_perf_preset(name: str, tickers: list[str], main_ticker: str | None = No
 def delete_perf_preset(name: str):
     with get_conn() as conn:
         conn.execute("DELETE FROM perf_presets WHERE name = ?", [name])
+
+
+# ── Filter presets (saved filter/grouping configurations per monitor view) ──────
+def get_filter_presets(scope: str) -> dict[str, dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT name, settings FROM filter_presets WHERE scope = ? ORDER BY name",
+            [scope],
+        ).fetchall()
+    out: dict[str, dict] = {}
+    for name, settings in rows:
+        try:
+            out[name] = json.loads(settings)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def save_filter_preset(scope: str, name: str, settings: dict):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO filter_presets (scope, name, settings) VALUES (?, ?, ?)
+            ON CONFLICT (scope, name) DO UPDATE SET settings = excluded.settings
+            """,
+            [scope, name, json.dumps(settings)],
+        )
+
+
+def delete_filter_preset(scope: str, name: str):
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM filter_presets WHERE scope = ? AND name = ?", [scope, name]
+        )
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_perf_history(tickers_tuple: tuple[str, ...], auto_adjust: bool = True) -> dict[str, pd.Series]:
@@ -2417,6 +2689,372 @@ def render_color_settings_page():
     pass
 
 
+# ── Correlation analysis ────────────────────────────────────────────────────────
+# Lookback windows: label → date offset back from the latest available date.
+_CORR_WINDOWS: dict[str, "pd.DateOffset | None"] = {
+    "6M": pd.DateOffset(months=6),
+    "1Y": pd.DateOffset(years=1),
+    "2Y": pd.DateOffset(years=2),
+    "3Y": pd.DateOffset(years=3),
+    "5Y": pd.DateOffset(years=5),
+    "Max": None,
+}
+# Return frequency: label → (resample rule, periods/year for annualizing, min obs
+# required per pair). The minimum scales with frequency so monthly returns aren't
+# wiped out by a daily-sized threshold (a 1Y monthly window only has ~12 points).
+_CORR_FREQ: dict[str, tuple[str | None, int, int]] = {
+    "Daily":   (None,    252, 20),
+    "Weekly":  ("W-FRI",  52, 12),
+    "Monthly": ("ME",     12,  8),
+}
+
+
+def _corr_ticker_stats(prices: pd.Series, rets: pd.Series, periods_per_year: int) -> dict:
+    """Per-ticker return/risk over the window: CAGR, annualized volatility, and their
+    ratio (a Sharpe-like return-per-unit-of-risk with a 0% risk-free rate)."""
+    p = prices.dropna()
+    r = rets.dropna()
+    out = {"cagr": None, "vol": None, "ratio": None}
+    if len(p) >= 2:
+        years = (p.index[-1] - p.index[0]).days / 365.25
+        if years > 0 and p.iloc[0] > 0:
+            out["cagr"] = (p.iloc[-1] / p.iloc[0]) ** (1 / years) - 1
+    if len(r) >= 2:
+        out["vol"] = float(r.std() * (periods_per_year ** 0.5))
+    if out["cagr"] is not None and out["vol"]:
+        out["ratio"] = out["cagr"] / out["vol"]
+    return out
+
+
+def render_correlation_page():
+    st.title("🔗 Correlation")
+    st.caption(
+        "Find positions that move together. Highly correlated holdings add little "
+        "diversification, so the most-correlated pairs are candidates to trim."
+    )
+
+    with st.expander("ℹ️ How this is calculated"):
+        st.markdown(
+            """
+**Prices → returns.** Two rising stocks always look correlated on *price* (shared
+upward trend), so we correlate **returns** instead. Prices are **adjusted closes**
+from Yahoo Finance (dividends and splits folded in, i.e. total return), resampled to
+the chosen **frequency**, then turned into percentage changes.
+
+**Correlation (ρ).** The Pearson correlation of the two return series over the
+lookback window. `ρ = +1` → they move in lockstep; `ρ = 0` → unrelated; `ρ = −1` →
+they move oppositely. A pair needs **enough overlapping observations** (≥20 daily,
+≥12 weekly, ≥8 monthly) or it is skipped (different listing dates, holidays across
+exchanges).
+
+**Frequency & window.** *Weekly* returns over *1 year* is the default — daily returns
+are noisy, monthly smooths too much; a 1-year window reflects the current regime.
+Correlation is not stable, so try a couple of windows.
+
+**Pruning helper.** For each highly correlated pair, each stock's **CAGR**
+(annualized price return) is divided by its **annualized volatility** (std. dev. of
+returns × √periods-per-year) to get a return-per-unit-of-risk ratio. We suggest
+**keeping** the higher-ratio stock and flag the other as a drop candidate.
+
+> Correlation ≠ redundancy. Two correlated names can still differ in risk and
+> drawdown. These are **candidates to review**, not instructions.
+            """
+        )
+
+    # ── Ticker selection ──────────────────────────────────────────────────────
+    # ── Ticker selection (mirrors the Performance tab, split by axis) ─────────
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT i.ticker, COALESCE(n.name, i.ticker) AS display_name
+            FROM items i
+            LEFT JOIN ticker_names n ON n.ticker = i.ticker
+            ORDER BY i.ticker
+        """).fetchall()
+    if not rows:
+        st.info("No tickers found in your watchlists. Add some stocks first.")
+        return
+    name_map = {t: name for t, name in rows}
+
+    watchlists = get_watchlists()
+
+    # Bulk-load helpers append tickers onto one axis's multiselect in session_state.
+    def _append_axis(axis: str, to_add: list[str]):
+        key = f"corr_tickers_{axis}"
+        cur = list(st.session_state.get(key, []))
+        cur_set = set(cur)
+        for t in to_add:
+            if t in name_map and t not in cur_set:
+                cur.append(t)
+                cur_set.add(t)
+        st.session_state[key] = cur
+
+    def _axis_load_buttons(to_add: list[str], enabled: bool, key_prefix: str):
+        bx, by = st.columns(2)
+        if bx.button("⬇ Load to X axis", disabled=not enabled,
+                     key=f"{key_prefix}_x", use_container_width=True):
+            _append_axis("x", to_add)
+            st.rerun()
+        if by.button("⬇ Load to Y axis", disabled=not enabled,
+                     key=f"{key_prefix}_y", use_container_width=True):
+            _append_axis("y", to_add)
+            st.rerun()
+
+    if watchlists:
+        with st.expander("📋 Load stocks from watchlist(s)"):
+            wl_pick = st.multiselect(
+                "Watchlists", options=list(watchlists.keys()),
+                placeholder="Choose one or more watchlists…",
+                key="corr_wl_pick", label_visibility="collapsed",
+            )
+            _axis_load_buttons(
+                [t for wl in wl_pick for t in watchlists.get(wl, [])],
+                bool(wl_pick), "corr_load_wl",
+            )
+
+    _all_tags = get_all_tags()
+    if _all_tags:
+        with st.expander("🏷️ Load stocks from tag(s)"):
+            tag_pick = st.multiselect(
+                "Tags", options=_all_tags, placeholder="Choose one or more tags…",
+                key="corr_tag_pick", label_visibility="collapsed",
+            )
+            tmap = get_tags_map()
+            _axis_load_buttons(
+                [t for t, tg in tmap.items() if set(tag_pick) & set(tg)],
+                bool(tag_pick), "corr_load_tag",
+            )
+
+    _fmt = lambda t: f"{t} — {name_map[t]}" if name_map[t] != t else t
+    cx, cy = st.columns(2)
+    with cx:
+        xsel = st.multiselect(
+            "X-axis stocks", options=list(name_map.keys()), format_func=_fmt,
+            placeholder="Add stocks, or load from a watchlist/tag above…",
+            key="corr_tickers_x",
+        )
+    with cy:
+        ysel = st.multiselect(
+            "Y-axis stocks", options=list(name_map.keys()), format_func=_fmt,
+            placeholder="Empty → mirror the X axis",
+            key="corr_tickers_y",
+        )
+
+    xsel = list(dict.fromkeys(xsel))
+    ysel = list(dict.fromkeys(ysel))
+    # Mirror rule: an empty axis copies the other; both empty = all stocks.
+    if not xsel and not ysel:
+        xset = yset = list(name_map.keys())
+        st.caption("Showing **all stocks** on both axes — add stocks above to narrow, or split the axes.")
+    elif not ysel:
+        xset = yset = xsel
+    elif not xsel:
+        xset = yset = ysel
+    else:
+        xset, yset = xsel, ysel
+
+    union = list(dict.fromkeys(xset + yset))
+    if len(union) < 2:
+        st.info("Need at least two distinct stocks to compute correlations.")
+        return
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    c_win, c_freq, c_thr = st.columns([2, 2, 3])
+    with c_win:
+        window = st.radio("Lookback window", list(_CORR_WINDOWS.keys()),
+                          index=1, horizontal=True, key="corr_window")
+    with c_freq:
+        freq = st.radio("Return frequency", list(_CORR_FREQ.keys()),
+                        index=1, horizontal=True, key="corr_freq")
+    with c_thr:
+        threshold = st.slider("High-correlation threshold", 0.50, 0.99, 0.80, 0.01,
+                              key="corr_threshold")
+        st.caption("Pairs at or above this ρ are flagged as redundancy candidates.")
+
+    # ── Compute gate ──────────────────────────────────────────────────────────
+    # The fetch + correlation is expensive, so don't run it on page open or on
+    # every stock change. Compute only when the button is pressed; keep the last
+    # result until the stock set / window / frequency changes.
+    sig = (tuple(sorted(union)), window, freq)
+    if st.button("📊 Compute correlations", type="primary", key="corr_compute"):
+        st.session_state["corr_sig"] = sig
+    if st.session_state.get("corr_sig") != sig:
+        st.info("Pick your stocks and options above, then press **📊 Compute correlations**.")
+        return
+
+    # ── Fetch, slice, resample, returns ──────────────────────────────────────
+    with st.spinner("Fetching price history…"):
+        hist = _fetch_perf_history(tuple(sorted(union)))
+
+    missing = [t for t in union if t not in hist or hist[t].empty]
+    if missing:
+        st.warning(f"No price history for: {', '.join(sorted(missing))}")
+    have = [t for t in union if t in hist and not hist[t].empty]
+    if len(have) < 2:
+        st.info("Not enough stocks with price history to compute correlations.")
+        return
+
+    prices = pd.DataFrame({t: hist[t] for t in have}).sort_index()
+    offset = _CORR_WINDOWS[window]
+    if offset is not None:
+        cutoff = prices.index[-1] - offset
+        prices = prices[prices.index >= cutoff]
+
+    rule, periods_per_year, min_obs = _CORR_FREQ[freq]
+    sampled = prices if rule is None else prices.resample(rule).last()
+    returns = sampled.pct_change().dropna(how="all")
+
+    # Drop columns that don't have enough observations to correlate at all.
+    enough = [c for c in returns.columns if returns[c].notna().sum() >= min_obs]
+    thin = [c for c in returns.columns if c not in enough]
+    if thin:
+        st.warning(
+            f"Too little data in this window for: {', '.join(sorted(thin))} "
+            f"(need ≥{min_obs} {freq.lower()} observations)."
+        )
+    returns = returns[enough]
+    if returns.shape[1] < 2:
+        st.info("Not enough stocks with sufficient history in this window.")
+        return
+
+    corr = returns.corr(min_periods=min_obs)
+
+    # Restrict each axis to the stocks that survived the data checks.
+    avail = set(returns.columns)
+    x_labels = [t for t in xset if t in avail]
+    y_labels = [t for t in yset if t in avail]
+    if not x_labels or not y_labels:
+        st.info("Not enough stocks with sufficient history on both axes.")
+        return
+
+    meta = get_ticker_meta()
+    def _name(t: str) -> str:
+        v = meta.get(t)
+        return v[0] if (v and v[0]) else t
+
+    st.caption(
+        f"X: {len(x_labels)} · Y: {len(y_labels)} stocks · {freq.lower()} returns · "
+        f"{window} window · as of {prices.index[-1].strftime('%Y-%m-%d')}"
+    )
+
+    # ── View a: heatmap ───────────────────────────────────────────────────────
+    st.subheader("Correlation heatmap")
+    import plotly.graph_objects as go
+    # When both axes hold the same set, hide the mirror half (keep the lower
+    # triangle, i > j) since the upper half is redundant and the diagonal is 1.
+    # When the axes differ, show the full rectangle but blank self-pairs (ρ = 1).
+    symmetric = x_labels == y_labels
+    z, text = [], []
+    heatmap_pairs: set[frozenset] = set()
+    for i, yt in enumerate(y_labels):
+        zrow, trow = [], []
+        for j, xt in enumerate(x_labels):
+            v = corr.loc[yt, xt]
+            show = pd.notna(v) and xt != yt and (not symmetric or i > j)
+            zrow.append(float(v) if show else None)
+            trow.append(f"{v:.2f}" if show else "")
+            if show:
+                heatmap_pairs.add(frozenset((xt, yt)))
+        z.append(zrow)
+        text.append(trow)
+    fig = go.Figure(go.Heatmap(
+        z=z, x=x_labels, y=y_labels,
+        zmin=-1, zmax=1, zmid=0,
+        # Diverging blue↔red with a neutral gray midpoint: red = high positive
+        # correlation (the thing we're flagging), blue = negative, gray ≈ 0.
+        colorscale=[[0.0, "#2a78d6"], [0.5, "#f0efec"], [1.0, "#d03b3b"]],
+        colorbar=dict(title="ρ"),
+        text=text, texttemplate="%{text}", textfont=dict(size=10),
+        hoverongaps=False,
+        hovertemplate="%{y} vs %{x}<br>ρ = %{z:.2f}<extra></extra>",
+    ))
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(height=max(380, 26 * len(y_labels) + 160),
+                      margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── View b: most-correlated pairs ────────────────────────────────────────
+    st.subheader("Most-correlated pairs")
+    cols = list(corr.columns)
+    pair_rows = []
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            a, b = cols[i], cols[j]
+            # Only pairs that are actually drawn in the heatmap above.
+            if frozenset((a, b)) not in heatmap_pairs:
+                continue
+            rho = corr.iat[i, j]
+            if pd.isna(rho):
+                continue
+            obs = int(returns[[a, b]].dropna().shape[0])
+            pair_rows.append({
+                "A": a, "Name A": _name(a), "B": b, "Name B": _name(b),
+                "ρ": float(rho), "Obs": obs,
+            })
+    if not pair_rows:
+        st.info("No pairs in the heatmap had enough overlapping data to correlate.")
+        return
+    pairs_df = pd.DataFrame(pair_rows).sort_values("ρ", ascending=False).reset_index(drop=True)
+
+    def _hi(row):
+        hot = row["ρ"] >= threshold
+        return ["background-color: #fde2e1" if hot else "" for _ in row]
+
+    st.dataframe(
+        pairs_df.style.apply(_hi, axis=1).format({"ρ": "{:.2f}"}),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(f"Rows highlighted in red have ρ ≥ {threshold:.2f}.")
+
+    # ── View c: redundancy / pruning helper ──────────────────────────────────
+    st.subheader("Redundancy — candidates to trim")
+    hot_pairs = pairs_df[pairs_df["ρ"] >= threshold]
+    if hot_pairs.empty:
+        st.info(f"No pairs reach ρ ≥ {threshold:.2f} in this window.")
+        return
+
+    stats = {
+        t: _corr_ticker_stats(prices[t], returns[t], periods_per_year)
+        for t in cols
+    }
+
+    def _fmt_pct(x):
+        return "—" if x is None else f"{x * 100:.1f}%"
+
+    def _fmt_ratio(x):
+        return "—" if x is None else f"{x:.2f}"
+
+    prune_rows = []
+    for _, r in hot_pairs.iterrows():
+        a, b = r["A"], r["B"]
+        ra = stats[a]["ratio"]
+        rb = stats[b]["ratio"]
+        # Keep the higher return/risk ratio; an unknown ratio loses the tie-break.
+        if (rb if rb is not None else -1e9) > (ra if ra is not None else -1e9):
+            keep, drop = b, a
+        else:
+            keep, drop = a, b
+        prune_rows.append({
+            "Pair": f"{a} ↔ {b}",
+            "ρ": float(r["ρ"]),
+            "Keep": f"{keep} ({_name(keep)})",
+            "Keep ret/risk": _fmt_ratio(stats[keep]["ratio"]),
+            "Keep CAGR": _fmt_pct(stats[keep]["cagr"]),
+            "Drop candidate": f"{drop} ({_name(drop)})",
+            "Drop ret/risk": _fmt_ratio(stats[drop]["ratio"]),
+            "Drop CAGR": _fmt_pct(stats[drop]["cagr"]),
+        })
+    prune_df = pd.DataFrame(prune_rows)
+    st.dataframe(
+        prune_df.style.format({"ρ": "{:.2f}"}),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "For each flagged pair, the stock with the higher return-per-unit-of-risk "
+        "(CAGR ÷ annualized volatility) is suggested to keep. Review before acting — "
+        "a drop candidate may still serve a purpose (sector exposure, lower drawdown)."
+    )
+
+
 # ── Navigation (native sidebar menu) ───────────────────────────────────────────
 ALL_LABEL = "⭐ All"
 
@@ -2446,6 +3084,247 @@ def _edit_page():
     render_edit_screen(get_watchlists())
 
 
+# ── Stock levels page ────────────────────────────────────────────────────────
+def render_levels_page():
+    st.title("🎚️ Levels")
+    st.caption(
+        "Record the price levels that matter for each stock — support, resistance, "
+        "buy/sell targets, stops — with a note per level and a general comment per stock."
+    )
+
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT i.ticker, COALESCE(n.name, i.ticker) AS display_name
+            FROM items i
+            LEFT JOIN ticker_names n ON n.ticker = i.ticker
+            ORDER BY i.ticker
+        """).fetchall()
+    if not rows:
+        st.info("No tickers found in your watchlists. Add some stocks first.")
+        return
+    name_map = {t: name for t, name in rows}
+
+    tab_edit, tab_overview, tab_types = st.tabs(
+        ["✏️ Create / edit", "📋 Overview", "⚙️ Types"]
+    )
+
+    # ── Create / edit a single stock ──────────────────────────────────────────
+    with tab_edit:
+        _fmt = lambda t: f"{t} — {name_map[t]}" if name_map[t] != t else t
+        ticker = st.selectbox(
+            "Stock", options=list(name_map.keys()), format_func=_fmt, key="levels_ticker"
+        )
+
+        # ── General comment ────────────────────────────────────────────────────
+        st.subheader("General comment")
+        note = st.text_area(
+            "Your overall notes for this stock",
+            value=get_stock_note(ticker),
+            key=f"stock_note_{ticker}",
+            label_visibility="collapsed",
+            placeholder="e.g. Accumulate on weakness, long-term hold…",
+        )
+        if st.button("Save comment", type="primary", key=f"save_note_{ticker}"):
+            set_stock_note(ticker, note)
+            st.success("Comment saved.")
+            st.rerun()
+
+        # ── Price levels ───────────────────────────────────────────────────────
+        st.subheader("Price levels")
+        levels = get_levels(ticker)
+        type_options = get_level_types()
+        # Keep any legacy type still on a saved level in the options, so the
+        # selectbox never chokes on a value that was later removed from Types.
+        type_options = list(dict.fromkeys(type_options + [lv["level_type"] for lv in levels]))
+        default_type = type_options[0] if type_options else "Support"
+        editor_df = pd.DataFrame(
+            {
+                "Price": pd.Series([lv["price"] for lv in levels], dtype="float64"),
+                "Type": pd.Series([lv["level_type"] for lv in levels], dtype="object"),
+                "Note": pd.Series([lv["note"] for lv in levels], dtype="object"),
+            }
+        )
+        edited = st.data_editor(
+            editor_df,
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Price": st.column_config.NumberColumn(
+                    "Price", format="%.2f", required=True, min_value=0.0
+                ),
+                "Type": st.column_config.SelectboxColumn(
+                    "Type", options=type_options, required=True, default=default_type
+                ),
+                "Note": st.column_config.TextColumn("Note", help="Optional note for this level"),
+            },
+            key=f"levels_editor_{ticker}",
+        )
+        if st.button("Save levels", type="primary", key=f"save_levels_{ticker}"):
+            new_levels = []
+            skipped = 0
+            for _, r in edited.iterrows():
+                price = r["Price"]
+                if price is None or pd.isna(price):
+                    skipped += 1
+                    continue
+                new_levels.append(
+                    {
+                        "price": float(price),
+                        "level_type": r["Type"] or default_type,
+                        "note": (r["Note"] or "").strip(),
+                    }
+                )
+            replace_levels(ticker, new_levels)
+            msg = f"Saved {len(new_levels)} level(s)."
+            if skipped:
+                msg += f" Skipped {skipped} row(s) with no price."
+            st.success(msg)
+            st.rerun()
+
+    # ── Overview of everything recorded so far ─────────────────────────────────
+    with tab_overview:
+        levels_map = get_levels_map()
+        notes_map = get_stock_notes_map()
+        recorded = sorted(set(levels_map) | set(notes_map))
+        if not recorded:
+            st.info("Nothing recorded yet. Add levels or a comment in the other tab.")
+        else:
+            with st.spinner("Fetching current prices…"):
+                quotes = fetch_quotes(recorded)
+            price_map = dict(zip(quotes["Ticker"], quotes["Price"]))
+
+            rows = []
+            for t in recorded:
+                cur = price_map.get(t)
+                comment = notes_map.get(t, "")
+                tlevels = levels_map.get(t, [])
+                if tlevels:
+                    for lv in tlevels:
+                        level = lv["price"]
+                        # Signed: level below current price → negative.
+                        dist = (level - cur) / cur * 100 if cur else None
+                        rows.append({
+                            "Ticker": t,
+                            "Name": name_map.get(t, t),
+                            "Type": lv["level_type"],
+                            "Level": level,
+                            "Current": cur,
+                            "Distance %": dist,
+                            "Note": lv["note"],
+                            "Comment": comment,
+                        })
+                else:
+                    rows.append({
+                        "Ticker": t,
+                        "Name": name_map.get(t, t),
+                        "Type": "",
+                        "Level": None,
+                        "Current": cur,
+                        "Distance %": None,
+                        "Note": "",
+                        "Comment": comment,
+                    })
+
+            overview_df = pd.DataFrame(rows)
+
+            def _dist_bg(col):
+                out = []
+                for v in col:
+                    if v is None or pd.isna(v):
+                        out.append("")
+                    elif v >= 0:
+                        out.append("background-color: #39b36a; color: #ffffff")  # above → green
+                    else:
+                        out.append("background-color: #e4584f; color: #ffffff")  # below → red
+                return out
+
+            def _show(df):
+                if df.empty:
+                    st.caption("No rows.")
+                    return
+                styler = (
+                    df.style
+                    .apply(_dist_bg, subset=["Distance %"])
+                    .format(
+                        {"Level": "{:.2f}", "Current": "{:.2f}", "Distance %": "{:+.2f}%"},
+                        na_rep="—",
+                    )
+                )
+                st.dataframe(styler, hide_index=True, use_container_width=True)
+
+            # ── Filter / group controls ─────────────────────────────────────────
+            present = set(overview_df["Type"])
+            type_order = [t for t in get_level_types() if t in present]
+            type_order += [t for t in overview_df["Type"].unique()
+                           if t and t not in type_order]
+            c_filt, c_grp = st.columns([3, 1])
+            with c_filt:
+                sel_types = st.multiselect(
+                    "Filter by type", options=type_order,
+                    placeholder="All types", key="levels_overview_filter",
+                )
+            with c_grp:
+                group = st.checkbox("Group by type", key="levels_overview_group")
+
+            view = overview_df
+            if sel_types:
+                view = view[view["Type"].isin(sel_types)]
+
+            if group:
+                shown = [t for t in type_order if not sel_types or t in sel_types]
+                for t in shown:
+                    sub = view[view["Type"] == t]
+                    if sub.empty:
+                        continue
+                    st.markdown(f"**{t}**")
+                    _show(sub.drop(columns=["Type"]))
+                # Comment-only rows (no type) — only when not filtering to specific types
+                if not sel_types:
+                    rest = view[view["Type"] == ""]
+                    if not rest.empty:
+                        st.markdown("**(no type)**")
+                        _show(rest.drop(columns=["Type"]))
+            else:
+                _show(view)
+
+            st.caption(
+                "Distance is the gap from the current price to the level, as a % of the "
+                "current price. Negative (red) = level below the current price; "
+                "positive (green) = above."
+            )
+
+
+    # ── Maintain the level types ───────────────────────────────────────────────
+    with tab_types:
+        st.caption(
+            "Maintain the list of level types available in the **Type** dropdown. "
+            "Reorder, rename, add or remove rows, then save. Existing levels keep "
+            "their stored type even if you remove it here."
+        )
+        types = get_level_types()
+        types_df = pd.DataFrame({"Type": pd.Series(types, dtype="object")})
+        edited_types = st.data_editor(
+            types_df,
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Type": st.column_config.TextColumn("Type", required=True),
+            },
+            key="level_types_editor",
+        )
+        if st.button("Save types", type="primary", key="save_level_types"):
+            new_types = [(r["Type"] or "").strip() for _, r in edited_types.iterrows()]
+            new_types = [t for t in new_types if t]
+            if not new_types:
+                st.warning("Keep at least one type — nothing saved.")
+            else:
+                set_level_types(new_types)
+                st.success(f"Saved {len(dict.fromkeys(new_types))} type(s).")
+                st.rerun()
+
+
 WATCHLISTS = get_watchlists()
 STATUSES = get_watchlist_statuses()
 
@@ -2460,6 +3339,8 @@ for name in WATCHLISTS:
 
 analysis_pages = [
     st.Page(render_performance_page, title="Performance", icon="📊", url_path="performance"),
+    st.Page(render_correlation_page, title="Correlation", icon="🔗", url_path="correlation"),
+    st.Page(render_levels_page, title="Levels", icon="🎚️", url_path="levels"),
     st.Page(render_search_page, title="Search", icon="🔎", url_path="search"),
 ]
 
