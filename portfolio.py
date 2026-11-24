@@ -35,6 +35,9 @@ from core import (
     compute_returns,
     convert_to_base,
     fx_tickers_for,
+    latest_fx_to_base,
+    search_tickers,
+    validate_ticker,
     weighted_avg_correlation,
     portfolio_risk,
 )
@@ -48,6 +51,11 @@ MAP_FILE = DATA_DIR / "ticker_map.csv"
 COL_NAME = "Name"
 COL_SYMBOL = "Symbol"
 COL_VALUE = "Marktwert"
+COL_SHARES = "Bestand"
+
+# Flag a position whose live value differs from the PP export by more than this
+# (likely a share-ratio / wrong-listing mapping, not normal price drift).
+VAL_FLAG_THRESHOLD = 0.40
 
 
 def _table_height(n_rows: int) -> int:
@@ -75,9 +83,13 @@ def _corr_bg(v) -> str:
 
 # ── Load & parse the Portfolio Performance CSV ───────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
-def load_portfolio(path: str) -> pd.DataFrame:
-    """Parse a PP 'Statement of Assets' CSV (German number format) into a tidy
-    table of real positions: Name, Symbol, Marktwert (EUR), Weight.
+def load_portfolio(path: str) -> tuple[pd.DataFrame, float]:
+    """Parse a PP 'Statement of Assets' CSV (German number format).
+
+    Returns (positions, pp_total) where:
+      positions  tidy frame: Name, Symbol, Shares, Marktwert (EUR, as exported), Weight
+      pp_total   the grand-total market value from the 'Summe' row (for the
+                 live-valuation cross-check)
 
     PP exports group/subtotal rows (Core, DivWachstum, …) and a grand-total
     'Summe' row — all of which have an empty Symbol, so we keep only rows that
@@ -98,22 +110,33 @@ def load_portfolio(path: str) -> pd.DataFrame:
             f"CSV is missing expected column(s): {', '.join(sorted(missing))}. "
             f"Found: {', '.join(df.columns)}"
         )
+    has_shares = COL_SHARES in df.columns
+
+    # Grand total from the 'Summe' row (before we drop the non-position rows).
+    pp_total = 0.0
+    summe = df[df[COL_NAME].astype("string").str.strip() == "Summe"]
+    if not summe.empty:
+        pp_total = float(pd.to_numeric(summe[COL_VALUE], errors="coerce").dropna().iloc[0])
 
     # Keep only real positions (group headers & the 'Summe' total have no Symbol).
     df = df[df[COL_SYMBOL].notna() & (df[COL_SYMBOL].str.strip() != "")].copy()
     df[COL_SYMBOL] = df[COL_SYMBOL].str.strip()
     df[COL_VALUE] = pd.to_numeric(df[COL_VALUE], errors="coerce")
+    df[COL_SHARES] = pd.to_numeric(df[COL_SHARES], errors="coerce") if has_shares else 0.0
     df = df.dropna(subset=[COL_VALUE])
     df = df[df[COL_VALUE] > 0]
 
     # Collapse any duplicate tickers (same security held in two sleeves).
     g = df.groupby(COL_SYMBOL, as_index=False).agg(
         Name=(COL_NAME, "first"),
+        Shares=(COL_SHARES, "sum"),
         Marktwert=(COL_VALUE, "sum"),
     )
     total = g["Marktwert"].sum()
     g["Weight"] = g["Marktwert"] / total if total > 0 else 0.0
-    return g.sort_values("Marktwert", ascending=False).reset_index(drop=True)
+    if pp_total <= 0:
+        pp_total = float(total)
+    return g.sort_values("Marktwert", ascending=False).reset_index(drop=True), pp_total
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -229,7 +252,7 @@ else:
 
 # ── Load holdings + mapping ──────────────────────────────────────────────────
 try:
-    holdings = load_portfolio(source)
+    holdings, pp_total = load_portfolio(source)
 except Exception as e:
     st.error(f"Could not read the portfolio CSV: {e}")
     st.stop()
@@ -255,6 +278,105 @@ else:
         f"{BASE_CURRENCY})."
     )
 
+# ── Simulate adding stocks (what-if) ─────────────────────────────────────────
+st.session_state.setdefault("sim_holdings", [])
+
+with st.expander("➕ Simulate adding stocks (what-if)"):
+    st.caption(
+        "Search Yahoo, enter a share count, preview the market value, then add. "
+        "Simulated positions are included in the correlation & risk below alongside "
+        "your real holdings. They are not saved anywhere."
+    )
+    query = st.text_input("Search Yahoo (ticker or company name)",
+                          placeholder="e.g. AAPL, Nestlé, VWCE.DE", key="sim_query")
+    results = search_tickers(query) if query.strip() else []
+
+    if query.strip() and not results:
+        st.caption("No matches — try a different term or an exact ticker.")
+    if results:
+        labels = {
+            i: f"{r['symbol']} — {r['name']}"
+               + (f" · {r['exchange']}" if r['exchange'] else "")
+               + (f" · {r['type']}" if r['type'] else "")
+            for i, r in enumerate(results)
+        }
+        idx = st.selectbox("Match", list(labels.keys()),
+                           format_func=lambda i: labels[i], key="sim_pick")
+        chosen = results[idx]
+        quote = validate_ticker(chosen["symbol"])
+
+        if not quote.get("ok"):
+            st.warning(quote.get("error", "Could not fetch a quote for this symbol."))
+        else:
+            cur = quote["currency"] or BASE_CURRENCY
+            price = float(quote["price"])
+            c_sh, c_pv = st.columns([1, 2])
+            with c_sh:
+                shares = st.number_input("Number of shares", min_value=0.0,
+                                         value=1.0, step=1.0, format="%.4f",
+                                         key="sim_shares")
+            eur_per = latest_fx_to_base(cur)
+            with c_pv:
+                if eur_per is None:
+                    st.warning(f"No {cur}→{BASE_CURRENCY} FX rate available — cannot value this.")
+                    mv_eur = None
+                else:
+                    mv_eur = shares * price * eur_per
+                    fx_note = "" if cur == BASE_CURRENCY else f" · {cur}→{BASE_CURRENCY} @ {eur_per:.4f}"
+                    st.metric(
+                        f"Market value ({BASE_CURRENCY})",
+                        f"{mv_eur:,.2f}",
+                        help=f"{shares:g} × {price:,.2f} {cur}{fx_note}",
+                    )
+                    st.caption(f"Last price: {price:,.2f} {cur} · as of {quote['last_update']}")
+
+            disabled = (mv_eur is None) or (shares <= 0)
+            if st.button("➕ Add to simulation", disabled=disabled, key="sim_add"):
+                st.session_state["sim_holdings"].append({
+                    "name": chosen["name"],
+                    "ticker": chosen["symbol"],
+                    "currency": cur,
+                    "shares": float(shares),
+                    "price": price,
+                    "mv_eur": float(mv_eur),
+                })
+                st.rerun()
+
+    sims = st.session_state["sim_holdings"]
+    if sims:
+        st.markdown("**Simulated additions**")
+        for i, s in enumerate(sims):
+            c1, c2 = st.columns([6, 1])
+            c1.write(
+                f"`{s['ticker']}` {s['name']} — {s['shares']:g} sh "
+                f"≈ **{s['mv_eur']:,.0f} {BASE_CURRENCY}** ({s['currency']})"
+            )
+            if c2.button("✕", key=f"sim_rm_{i}", help="Remove"):
+                st.session_state["sim_holdings"].pop(i)
+                st.rerun()
+        if st.button("Clear all simulated", key="sim_clear"):
+            st.session_state["sim_holdings"] = []
+            st.rerun()
+
+# Merge simulated positions into the holdings, then (re)compute weights over the
+# combined total so every weight reflects the what-if portfolio.
+holdings["Sim"] = ""
+sims = st.session_state["sim_holdings"]
+if sims:
+    sim_rows = pd.DataFrame([{
+        "Symbol": f"SIM:{s['ticker']}",
+        "Name": s["name"],
+        "Shares": s["shares"],
+        "Marktwert": s["mv_eur"],
+        "Yahoo": s["ticker"],
+        "Currency": s["currency"],
+        "Sim": "➕",
+    } for s in sims])
+    holdings = pd.concat([holdings, sim_rows], ignore_index=True)
+
+total = holdings["Marktwert"].sum()
+holdings["Weight"] = holdings["Marktwert"] / total if total > 0 else 0.0
+
 total_value = float(holdings["Marktwert"].sum())
 st.caption(f"**{len(holdings)} positions** · total value **{total_value:,.0f} {BASE_CURRENCY}**")
 
@@ -262,7 +384,7 @@ show = holdings.copy()
 show["Weight %"] = (show["Weight"] * 100).round(2)
 show["Marktwert"] = show["Marktwert"].round(2)
 st.dataframe(
-    show[["Name", "Symbol", "Yahoo", "Currency", "Marktwert", "Weight %"]],
+    show[["Sim", "Name", "Symbol", "Yahoo", "Currency", "Marktwert", "Weight %"]],
     hide_index=True,
     use_container_width=True,
     height=_table_height(len(show)),
@@ -277,13 +399,26 @@ with c_freq:
     freq = st.radio("Return frequency", list(_CORR_FREQ.keys()),
                     index=1, horizontal=True, key="pf_freq")
 
-# Signature includes the mapping so re-mapping invalidates a stale result.
-map_sig = tuple(sorted(zip(holdings["Symbol"], holdings["Yahoo"], holdings["Currency"])))
-sig = (map_sig, window, freq)
+VAL_SNAPSHOT = "PP snapshot (as exported)"
+VAL_LIVE = "Live (shares × current price)"
+val_mode = st.radio(
+    "Valuation", [VAL_SNAPSHOT, VAL_LIVE], index=1, horizontal=True, key="pf_val_mode",
+    help="Snapshot: use the market values from the CSV export. "
+         "Live: recompute each position as shares × current Yahoo price, converted "
+         "to EUR — always up to date, but assumes 1 CSV share = 1 Yahoo-ticker share.",
+)
+
+# Signature includes the mapping, market values AND valuation mode (so re-mapping,
+# changing a simulated position, or switching valuation invalidates a stale result).
+map_sig = tuple(sorted(
+    (r.Symbol, r.Yahoo, r.Currency, round(float(r.Marktwert), 2), round(float(r.Shares), 6))
+    for r in holdings.itertuples()
+))
+sig = (map_sig, window, freq, val_mode)
 if st.button("📊 Compute portfolio correlation", type="primary", key="pf_compute"):
     st.session_state["pf_sig"] = sig
 if st.session_state.get("pf_sig") != sig:
-    st.info("Set the window and frequency, then press **📊 Compute portfolio correlation**.")
+    st.info("Set the options above, then press **📊 Compute portfolio correlation**.")
     st.stop()
 
 # ── Fetch prices + FX, convert to base currency ──────────────────────────────
@@ -297,6 +432,44 @@ with st.spinner("Fetching price history and FX rates from Yahoo…"):
 
 # FX series keyed by currency: 'C per base' (e.g. USD per EUR from EURUSD=X).
 cur_per_base = {c: fx_hist.get(f"{BASE_CURRENCY}{c}=X") for c in currencies if c != BASE_CURRENCY}
+
+# ── Live valuation (Option C): shares × latest price → EUR, per position ──────
+def _latest(s) -> float | None:
+    return float(s.iloc[-1]) if (s is not None and not s.empty) else None
+
+live_val: dict[str, float] = {}
+for r in holdings.itertuples():
+    px = _latest(hist_native.get(r.Yahoo))
+    if px is None:
+        continue
+    if r.Currency == BASE_CURRENCY:
+        epu = 1.0
+    else:
+        last_fx = _latest(cur_per_base.get(r.Currency))
+        if not last_fx:
+            continue
+        epu = 1.0 / last_fx
+    live_val[r.Symbol] = float(r.Shares) * px * epu
+
+# Cross-check live vs PP export (real positions only — sims aren't in the PP total)
+# and flag positions that diverge a lot (likely a share-ratio / wrong-listing map).
+snap_by_sym = holdings.set_index("Symbol")["Marktwert"]
+real_syms = set(holdings.loc[holdings["Sim"] != "➕", "Symbol"])
+live_real_total = sum(v for s, v in live_val.items() if s in real_syms)
+val_flags = []
+for s, lv in live_val.items():
+    snap = float(snap_by_sym.get(s, 0.0))
+    if snap > 0 and abs(lv / snap - 1.0) > VAL_FLAG_THRESHOLD:
+        nm = holdings.loc[holdings["Symbol"] == s, "Name"].iloc[0]
+        val_flags.append((s, nm, snap, lv, lv / snap - 1.0))
+
+# Apply the chosen valuation to the Marktwert / Weight used downstream.
+if val_mode == VAL_LIVE:
+    holdings = holdings.copy()
+    holdings["Marktwert"] = [live_val.get(s, m) for s, m in
+                             zip(holdings["Symbol"], holdings["Marktwert"])]
+    _tot = holdings["Marktwert"].sum()
+    holdings["Weight"] = holdings["Marktwert"] / _tot if _tot > 0 else 0.0
 
 # Build an EUR-converted price series per *position* (keyed by PP symbol).
 hist_by_pos: dict[str, pd.Series] = {}
@@ -341,6 +514,49 @@ if thin:
     )
 if no_price or no_fx or thin:
     st.caption("Weights renormalized over the remaining holdings.")
+
+# ── Valuation cross-check (live mode) ─────────────────────────────────────────
+if val_mode == VAL_LIVE:
+    st.divider()
+    st.subheader("Live valuation")
+    dev = (live_real_total / pp_total - 1.0) if pp_total > 0 else None
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric(f"Live value, real positions ({BASE_CURRENCY})", f"{live_real_total:,.0f}")
+    cc2.metric(f"PP export total ({BASE_CURRENCY})", f"{pp_total:,.0f}")
+    cc3.metric("Difference", f"{dev*100:+.1f}%" if dev is not None else "—")
+    if dev is not None and abs(dev) > 0.10:
+        st.warning(
+            f"Live total differs from the PP export by {dev*100:+.1f}%. Some drift is "
+            "normal (prices/FX move after export), but a large gap can also mean a "
+            "wrong ticker mapping or a share-ratio mismatch (e.g. an ADR)."
+        )
+
+    lv_tbl = holdings.copy()
+    lv_tbl["Live value"] = lv_tbl["Marktwert"].round(2)
+    lv_tbl["Weight %"] = (lv_tbl["Weight"] * 100).round(2)
+    lv_tbl["Shares"] = lv_tbl["Shares"].round(4)
+    lv_tbl = lv_tbl.sort_values("Marktwert", ascending=False)
+    st.dataframe(
+        lv_tbl[["Sim", "Name", "Symbol", "Yahoo", "Currency", "Shares", "Live value", "Weight %"]],
+        hide_index=True, use_container_width=True, height=_table_height(len(lv_tbl)),
+    )
+
+    if val_flags:
+        with st.expander(f"⚠️ {len(val_flags)} position(s) differ a lot from the export — check mapping"):
+            fdf = pd.DataFrame(
+                [{"Symbol": s, "Name": nm,
+                  f"Export ({BASE_CURRENCY})": round(snap, 2),
+                  f"Live ({BASE_CURRENCY})": round(lv, 2),
+                  "Δ %": round(d * 100, 1)}
+                 for s, nm, snap, lv, d in sorted(val_flags, key=lambda x: -abs(x[4]))],
+            )
+            st.caption(
+                "Large gaps often mean the Yahoo ticker isn't 1:1 with your holding "
+                "(wrong listing, or an ADR representing ≠1 share). Fix the ticker in "
+                f"`{MAP_FILE.name}`, or switch back to **{VAL_SNAPSHOT}**."
+            )
+            st.dataframe(fdf, hide_index=True, use_container_width=True,
+                         height=_table_height(len(fdf)))
 
 corr = returns.corr(min_periods=min_obs)
 

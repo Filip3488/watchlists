@@ -20,6 +20,7 @@ from config import (
 )
 from core import (
     _CORR_WINDOWS, _CORR_FREQ, _fetch_perf_history, _corr_ticker_stats,
+    validate_ticker, search_tickers,
 )
 
 st.set_page_config(page_title="Stock Monitor", layout="wide")
@@ -722,42 +723,7 @@ def _search_news(query: str, count: int) -> list[dict]:
         return []
 
 
-def validate_ticker(ticker: str) -> dict:
-    """Look up a ticker on Yahoo and return its metadata plus a freshness check."""
-    try:
-        t = yf.Ticker(ticker)
-        fast = t.fast_info
-        info = t.info
-
-        last_price = fast.last_price
-        if not last_price:
-            return {"ok": False, "error": "No price data found for this symbol."}
-
-        name     = info.get("longName") or info.get("shortName")
-        exchange = info.get("fullExchangeName") or info.get("exchange")
-        currency = fast.currency or info.get("currency") or ""
-
-        reg_time = info.get("regularMarketTime")
-        if reg_time:
-            last_update = datetime.fromtimestamp(reg_time)
-            age_days = (datetime.now() - last_update).days
-            fresh = age_days <= 5          # updated within the last ~trading week
-            ts_str = last_update.strftime("%Y-%m-%d %H:%M")
-        else:
-            fresh, ts_str = False, "—"
-
-        return {
-            "ok": True,
-            "ticker": ticker,
-            "name": name or "(name unavailable)",
-            "exchange": exchange or "(exchange unavailable)",
-            "price": last_price,
-            "currency": currency,
-            "last_update": ts_str,
-            "fresh": fresh,
-        }
-    except Exception as e:
-        return {"ok": False, "error": f"Lookup failed: {e}"}
+# validate_ticker moved to core.py (shared with portfolio.py)
 
 
 def fmt_pct(val):
@@ -1417,16 +1383,30 @@ def render_edit_screen(watchlists: dict[str, list[str]]):
             st.info("Create a watchlist first.")
         else:
             target_list = st.selectbox("Watchlist", list(watchlists.keys()), key="add_target")
-            new_ticker = st.text_input("Ticker symbol", placeholder="e.g. AAPL", key="add_ticker")
+            query = st.text_input(
+                "Search Yahoo (ticker or company name)",
+                placeholder="e.g. AAPL, Nestlé, VWCE.DE", key="add_query",
+            )
+            results = search_tickers(query) if query.strip() else []
 
-            if st.button("Check symbol"):
-                ticker = new_ticker.strip().upper()
-                if not ticker:
-                    st.session_state.pop("pending_add", None)
-                    st.warning("Enter a ticker.")
-                else:
-                    with st.spinner(f"Looking up {ticker}…"):
-                        st.session_state["pending_add"] = validate_ticker(ticker)
+            if results:
+                labels = {
+                    i: f"{r['symbol']} — {r['name']}"
+                       + (f" · {r['exchange']}" if r['exchange'] else "")
+                       + (f" · {r['type']}" if r['type'] else "")
+                    for i, r in enumerate(results)
+                }
+                pick = st.selectbox("Match", list(labels.keys()),
+                                    format_func=lambda i: labels[i], key="add_pick")
+                if st.button("Check symbol"):
+                    sym = results[pick]["symbol"]
+                    with st.spinner(f"Looking up {sym}…"):
+                        st.session_state["pending_add"] = validate_ticker(sym)
+            elif query.strip():
+                st.caption("No search matches — you can still check it as an exact ticker.")
+                if st.button(f"Check “{query.strip().upper()}” as exact ticker"):
+                    with st.spinner(f"Looking up {query.strip().upper()}…"):
+                        st.session_state["pending_add"] = validate_ticker(query.strip().upper())
 
             pending = st.session_state.get("pending_add")
             if pending:

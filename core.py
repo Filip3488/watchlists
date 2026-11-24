@@ -11,6 +11,8 @@ the portfolio app, their weights) is supplied by the caller.
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -221,4 +223,88 @@ def convert_to_base(price: pd.Series, cur_per_base: pd.Series | None) -> pd.Seri
         return price
     fx = cur_per_base.reindex(price.index).ffill().bfill()
     return (price / fx).dropna()
+
+
+# ── Yahoo search & live quotes (for the "simulate a new stock" feature) ───────
+@st.cache_data(ttl=600, show_spinner=False)
+def search_tickers(query: str, limit: int = 10) -> list[dict]:
+    """Yahoo symbol search → list of {symbol, name, exchange, type}.
+
+    Uses the same yf.Search endpoint the watchlist app uses for news. Returns
+    an empty list on any failure (Yahoo occasionally rate-limits)."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        quotes = yf.Search(q).quotes or []
+    except Exception:
+        return []
+    out: list[dict] = []
+    for r in quotes[:limit]:
+        sym = r.get("symbol")
+        if not sym:
+            continue
+        out.append({
+            "symbol": sym,
+            "name": r.get("longname") or r.get("shortname") or sym,
+            "exchange": r.get("exchange") or r.get("exchDisp") or "",
+            "type": r.get("quoteType") or r.get("typeDisp") or "",
+        })
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def validate_ticker(ticker: str) -> dict:
+    """Look up a ticker on Yahoo and return its metadata plus a freshness check.
+    Shared by the watchlist 'Add stock' flow and the portfolio 'simulate a stock'
+    feature. Returns {ok: False, error} on failure."""
+    try:
+        t = yf.Ticker(ticker)
+        fast = t.fast_info
+        info = t.info
+
+        last_price = fast.last_price
+        if not last_price:
+            return {"ok": False, "error": "No price data found for this symbol."}
+
+        name     = info.get("longName") or info.get("shortName")
+        exchange = info.get("fullExchangeName") or info.get("exchange")
+        currency = fast.currency or info.get("currency") or ""
+
+        reg_time = info.get("regularMarketTime")
+        if reg_time:
+            last_update = datetime.fromtimestamp(reg_time)
+            age_days = (datetime.now() - last_update).days
+            fresh = age_days <= 5          # updated within the last ~trading week
+            ts_str = last_update.strftime("%Y-%m-%d %H:%M")
+        else:
+            fresh, ts_str = False, "—"
+
+        return {
+            "ok": True,
+            "ticker": ticker,
+            "name": name or "(name unavailable)",
+            "exchange": exchange or "(exchange unavailable)",
+            "price": last_price,
+            "currency": (currency or "").upper(),
+            "last_update": ts_str,
+            "fresh": fresh,
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"Lookup failed: {e}"}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def latest_fx_to_base(currency: str, base: str = BASE_CURRENCY) -> float | None:
+    """Spot rate to convert 1 unit of ``currency`` into ``base`` (base per unit).
+    Returns 1.0 for the base currency, None if no FX series is available."""
+    c = (currency or "").strip().upper()
+    if not c or c == base:
+        return 1.0
+    sym = f"{base}{c}=X"  # C per 1 base
+    s = _fetch_perf_history((sym,)).get(sym)
+    if s is None or s.empty:
+        return None
+    cur_per_base = float(s.iloc[-1])
+    return (1.0 / cur_per_base) if cur_per_base else None
 
