@@ -8,6 +8,7 @@ import html
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 from populate_names import enrich as enrich_ticker_meta
 from config import (
@@ -3016,6 +3017,107 @@ def _edit_page():
     render_edit_screen(get_watchlists())
 
 
+# ── Level detail charts (click a ticker in the Overview to open) ─────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_ohlc(ticker: str) -> pd.DataFrame:
+    """Daily OHLC for one ticker (up to 16y). Empty frame on failure.
+
+    Uses auto_adjust=False so the candles are UNADJUSTED (split-adjusted only, not
+    dividend-adjusted) — matching TradingView's default chart and the prices you
+    record levels from. auto_adjust=True would back-adjust every historical bar
+    down by the cumulative dividend factor, so bars would sit a few % below
+    TradingView (and your level lines wouldn't line up with the bars)."""
+    try:
+        d = yf.download(ticker, period="16y", interval="1d",
+                        auto_adjust=False, progress=False, threads=True)
+    except Exception:
+        return pd.DataFrame()
+    if d is None or d.empty:
+        return pd.DataFrame()
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = d.columns.get_level_values(0)
+    keep = [c for c in ("Open", "High", "Low", "Close") if c in d.columns]
+    return d[keep].dropna()
+
+
+def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample daily OHLC into a coarser candle (first/max/min/last)."""
+    if df.empty:
+        return df
+    return df.resample(rule).agg(
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    ).dropna()
+
+
+def _candle_fig(df: pd.DataFrame, title: str, levels: list[float], height: int):
+    """A log-scale candlestick with a horizontal line at each recorded level."""
+    import math
+    import plotly.graph_objects as go
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"],
+        low=df["Low"], close=df["Close"], name=title, showlegend=False,
+    )])
+    for p in levels:
+        if p and p > 0:
+            fig.add_hline(
+                y=p, line=dict(color="#2962ff", width=1, dash="dash"),
+                annotation_text=f"{p:g}", annotation_position="top left",
+                annotation_font=dict(color="#2962ff", size=11),
+            )
+    # Candlesticks don't autorange on a log axis (Plotly draws the whole thing
+    # flat near the bottom with an absurd max), so set the range explicitly from
+    # the data and the level lines.
+    pts = [float(p) for p in levels if p and p > 0]
+    lo = min([float(df["Low"].min())] + pts)
+    hi = max([float(df["High"].max())] + pts)
+    if lo > 0 and hi > lo:
+        fig.update_yaxes(type="log", range=[math.log10(lo * 0.95), math.log10(hi * 1.05)])
+    else:
+        fig.update_yaxes(type="log")
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14)), height=height,
+        margin=dict(l=10, r=10, t=36, b=10),
+        xaxis_rangeslider_visible=False,
+    )
+    return fig
+
+
+def _render_level_charts(ticker: str, name: str, levels: list[dict]):
+    """Pop-up body: monthly + weekly side by side, daily full width below."""
+    st.markdown(f"### {name} · `{ticker}`")
+    try:
+        import plotly.graph_objects as go  # noqa: F401
+    except ModuleNotFoundError:
+        st.warning("Install `plotly` to see the interactive log-scale charts.")
+        return
+    with st.spinner("Fetching price history…"):
+        daily = _fetch_ohlc(ticker)
+    if daily.empty:
+        st.warning(f"No price history available for {ticker}.")
+        return
+
+    lv_prices = [float(lv["price"]) for lv in levels if lv.get("price")]
+    monthly = _resample_ohlc(daily, "ME")               # full history
+    weekly = _resample_ohlc(daily, "W-FRI").tail(260)   # ≈ 5 years
+    daily_v = daily.tail(252)                           # ≈ 1 year
+
+    st.caption(
+        ("Dashed blue lines mark your recorded levels. " if lv_prices
+         else "No levels recorded for this stock yet. ")
+        + "Y-axis is log-scaled; drag to zoom."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(_candle_fig(monthly, "Monthly · full history", lv_prices, 340),
+                        use_container_width=True)
+    with c2:
+        st.plotly_chart(_candle_fig(weekly, "Weekly · ≈5y", lv_prices, 340),
+                        use_container_width=True)
+    st.plotly_chart(_candle_fig(daily_v, "Daily · ≈1y", lv_prices, 420),
+                    use_container_width=True)
+
+
 # ── Stock levels page ────────────────────────────────────────────────────────
 def render_levels_page():
     st.title("🎚️ Levels")
@@ -3159,6 +3261,7 @@ def render_levels_page():
                     })
 
             overview_df = pd.DataFrame(rows)
+            meta = get_ticker_meta()
 
             def _dist_bg(col):
                 out = []
@@ -3171,19 +3274,47 @@ def render_levels_page():
                         out.append("background-color: #e4584f; color: #ffffff")  # below → red
                 return out
 
-            def _show(df):
+            def _to_display(df):
+                """Turn Ticker / Level into link URLs (label encoded for the regex)."""
+                d = df.copy()
+                raw = d["Ticker"].astype(str)
+                # Level → link to the standalone chart view; price kept for the label.
+                d["Level"] = [
+                    "" if (lv is None or pd.isna(lv))
+                    else f"?lvlchart={quote(t, safe='')}&p={lv:.2f}"
+                    for t, lv in zip(raw, d["Level"])
+                ]
+                # Ticker → TradingView; real symbol appended so the label regex can show it.
+                d["Ticker"] = [
+                    f"{tradingview_url(t, meta.get(t, ('', '', ''))[1] or '')}&yfsym={t}"
+                    for t in raw
+                ]
+                return d
+
+            link_cfg = {
+                "Ticker": st.column_config.LinkColumn(
+                    "Ticker", display_text=r"yfsym=(.+)$", help="Open chart on TradingView ↗"),
+                "Level": st.column_config.LinkColumn(
+                    "Level", display_text=r"&p=([\d.]+)$",
+                    help="Open monthly / weekly / daily charts with your levels ↗"),
+            }
+
+            def _show(df, cols):
                 if df.empty:
                     st.caption("No rows.")
                     return
                 styler = (
-                    df.style
+                    _to_display(df)[cols].style
                     .apply(_dist_bg, subset=["Distance %"])
-                    .format(
-                        {"Level": "{:.2f}", "Current": "{:.2f}", "Distance %": "{:+.2f}%"},
-                        na_rep="—",
-                    )
+                    .format({"Current": "{:.2f}", "Distance %": "{:+.2f}%"}, na_rep="—")
+                    .hide(axis="index")
                 )
-                st.dataframe(styler, hide_index=True, use_container_width=True)
+                height = (min(len(df), 60) + 1) * 35 + 3
+                st.dataframe(styler, column_config=link_cfg, hide_index=True,
+                             use_container_width=True, height=height)
+
+            cols_full = ["Ticker", "Name", "Type", "Level", "Current", "Distance %", "Note", "Comment"]
+            cols_grouped = ["Ticker", "Name", "Level", "Current", "Distance %", "Note", "Comment"]
 
             # ── Filter / group controls ─────────────────────────────────────────
             present = set(overview_df["Type"])
@@ -3199,6 +3330,11 @@ def render_levels_page():
             with c_grp:
                 group = st.checkbox("Group by type", key="levels_overview_group")
 
+            st.caption(
+                "Click a **Level** to open monthly / weekly / daily charts with your "
+                "levels; click a **ticker** to open it on TradingView ↗."
+            )
+
             view = overview_df
             if sel_types:
                 view = view[view["Type"].isin(sel_types)]
@@ -3210,15 +3346,15 @@ def render_levels_page():
                     if sub.empty:
                         continue
                     st.markdown(f"**{t}**")
-                    _show(sub.drop(columns=["Type"]))
+                    _show(sub, cols_grouped)
                 # Comment-only rows (no type) — only when not filtering to specific types
                 if not sel_types:
                     rest = view[view["Type"] == ""]
                     if not rest.empty:
                         st.markdown("**(no type)**")
-                        _show(rest.drop(columns=["Type"]))
+                        _show(rest, cols_grouped)
             else:
-                _show(view)
+                _show(view, cols_full)
 
             st.caption(
                 "Distance is the gap from the current price to the level, as a % of the "
@@ -3280,6 +3416,19 @@ settings_pages = [
     st.Page(_edit_page, title="Edit Watchlists", icon="✏️", url_path="edit"),
     st.Page(render_refresh_screen, title="Refresh Options", icon="🔄", url_path="refresh"),
 ]
+
+# ── Standalone level-chart view ──────────────────────────────────────────────
+# Opened (in a new tab) from a Level link in the Levels → Overview table, via a
+# `?lvlchart=<ticker>` query param. Rendered before navigation so it shows the
+# charts on their own, regardless of which page the link was clicked from.
+_chart_tkr = st.query_params.get("lvlchart")
+if _chart_tkr:
+    _nm = (get_ticker_meta().get(_chart_tkr, ("", "", ""))[0]) or _chart_tkr
+    if st.button("← Back", help="Close this chart view"):
+        st.query_params.clear()
+        st.rerun()
+    _render_level_charts(_chart_tkr, _nm, get_levels(_chart_tkr))
+    st.stop()
 
 nav = st.navigation({
     "Watchlists": watchlist_pages,
