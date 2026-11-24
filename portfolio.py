@@ -222,6 +222,11 @@ Using the full covariance matrix, the portfolio's annualized volatility
 (what you'd have if every holding moved in lockstep). The **diversification
 ratio** is the second ÷ the first: `1.0` = no benefit, higher is better.
 
+**What-if edits.** You can **add** simulated positions (search + share count)
+and **exclude** existing ones (uncheck *Include* in the holdings table, to
+simulate selling). Weights are always recomputed over whatever set is active, so
+every number below reflects the what-if portfolio.
+
 > Positions whose ticker has too little overlapping price history (or no FX rate)
 > in the chosen window are dropped and listed; the remaining weights are
 > renormalized, and the **% of portfolio value covered** is reported.
@@ -374,20 +379,65 @@ if sims:
     } for s in sims])
     holdings = pd.concat([holdings, sim_rows], ignore_index=True)
 
+holdings = holdings.reset_index(drop=True)
+
+# ── Include / exclude positions (simulate selling) ───────────────────────────
+# Persist the excluded set (by Symbol) so toggles survive reruns and feed the
+# compute signature below. Unchecking a holding re-weights the rest over the
+# smaller total — i.e. as if you had sold it.
+excluded = set(st.session_state.get("pf_excluded", []))
+inc_mask = ~holdings["Symbol"].isin(excluded)
+inc_total = float(holdings.loc[inc_mask, "Marktwert"].sum())
+
+editor = holdings.copy()
+editor["Include"] = inc_mask
+editor["Marktwert"] = editor["Marktwert"].round(2)
+editor["Weight %"] = (
+    (holdings["Marktwert"].where(inc_mask, 0.0) / inc_total * 100).round(2)
+    if inc_total > 0 else 0.0
+)
+
+st.caption(
+    "Uncheck **Include** to simulate selling a position — the rest are "
+    "re-weighted over the smaller total, and correlation & risk recompute on the "
+    "remaining holdings."
+)
+edited = st.data_editor(
+    editor[["Include", "Sim", "Name", "Symbol", "Yahoo", "Currency", "Marktwert", "Weight %"]],
+    column_config={
+        "Include": st.column_config.CheckboxColumn(
+            "Include",
+            help="Uncheck to exclude this position (simulate selling it).",
+            default=True,
+        ),
+    },
+    disabled=["Sim", "Name", "Symbol", "Yahoo", "Currency", "Marktwert", "Weight %"],
+    hide_index=True,
+    use_container_width=True,
+    height=_table_height(len(editor)),
+    key="pf_holdings_editor",
+)
+
+# Persist any change to the excluded set, then rerun so weights/labels refresh.
+new_excluded = set(edited.loc[~edited["Include"], "Symbol"])
+if new_excluded != excluded:
+    st.session_state["pf_excluded"] = sorted(new_excluded)
+    st.rerun()
+
+# Keep only the included positions and re-weight over their combined total.
+holdings = holdings[inc_mask].copy()
+if len(holdings) < 2:
+    st.info("Keep at least two positions included to compute correlation & risk.")
+    st.stop()
+
 total = holdings["Marktwert"].sum()
 holdings["Weight"] = holdings["Marktwert"] / total if total > 0 else 0.0
 
 total_value = float(holdings["Marktwert"].sum())
-st.caption(f"**{len(holdings)} positions** · total value **{total_value:,.0f} {BASE_CURRENCY}**")
-
-show = holdings.copy()
-show["Weight %"] = (show["Weight"] * 100).round(2)
-show["Marktwert"] = show["Marktwert"].round(2)
-st.dataframe(
-    show[["Sim", "Name", "Symbol", "Yahoo", "Currency", "Marktwert", "Weight %"]],
-    hide_index=True,
-    use_container_width=True,
-    height=_table_height(len(show)),
+n_excluded = int((~inc_mask).sum())
+st.caption(
+    f"**{len(holdings)} positions** · total value **{total_value:,.0f} {BASE_CURRENCY}**"
+    + (f" · {n_excluded} excluded" if n_excluded else "")
 )
 
 # ── Controls ─────────────────────────────────────────────────────────────────
@@ -519,11 +569,31 @@ if no_price or no_fx or thin:
 if val_mode == VAL_LIVE:
     st.divider()
     st.subheader("Live valuation")
-    dev = (live_real_total / pp_total - 1.0) if pp_total > 0 else None
-    cc1, cc2, cc3 = st.columns(3)
-    cc1.metric(f"Live value, real positions ({BASE_CURRENCY})", f"{live_real_total:,.0f}")
-    cc2.metric(f"PP export total ({BASE_CURRENCY})", f"{pp_total:,.0f}")
-    cc3.metric("Difference", f"{dev*100:+.1f}%" if dev is not None else "—")
+    # When positions are excluded, compare against the snapshot total of the
+    # *included* real positions (not the full PP export) so the check stays
+    # apples-to-apples and doesn't look like a mapping error.
+    if n_excluded:
+        base_total = float(snap_by_sym.reindex(sorted(real_syms)).fillna(0.0).sum())
+        base_label = f"Export total, included ({BASE_CURRENCY})"
+    else:
+        base_total = pp_total
+        base_label = f"PP export total ({BASE_CURRENCY})"
+    dev = (live_real_total / base_total - 1.0) if base_total > 0 else None
+    # What-if total: every INCLUDED position valued live — real holdings you kept
+    # checked plus any simulated additions (excluded positions are already gone).
+    live_total_all = float(sum(live_val.values()))
+    cc1, cc2, cc3, cc4 = st.columns(4)
+    cc1.metric(
+        f"What-if live total ({BASE_CURRENCY})", f"{live_total_all:,.0f}",
+        help="Every included position valued live: the real holdings you kept "
+             "checked plus any simulated additions. Excluded positions are left "
+             "out. This is the portfolio the correlation & risk below are based on.",
+    )
+    cc2.metric(f"Live value, real positions ({BASE_CURRENCY})", f"{live_real_total:,.0f}",
+               help="Included real holdings only — no simulated positions. This is "
+                    "the figure cross-checked against the export total.")
+    cc3.metric(base_label, f"{base_total:,.0f}")
+    cc4.metric("Difference", f"{dev*100:+.1f}%" if dev is not None else "—")
     if dev is not None and abs(dev) > 0.10:
         st.warning(
             f"Live total differs from the PP export by {dev*100:+.1f}%. Some drift is "
@@ -618,10 +688,15 @@ else:
 # ── Correlation matrix & top pairs ───────────────────────────────────────────
 st.divider()
 st.subheader("Correlation matrix")
+# Label rows/cols by Yahoo ticker (positions are keyed internally by PP symbol).
+yahoo_by_sym = holdings.set_index("Symbol")["Yahoo"].to_dict()
+name_by_sym = holdings.set_index("Symbol")["Name"].to_dict()
+corr_disp = corr.rename(index=lambda s: yahoo_by_sym.get(s, s),
+                        columns=lambda s: yahoo_by_sym.get(s, s))
 st.dataframe(
-    corr.round(2).style.map(_corr_bg),
+    corr_disp.round(2).style.map(_corr_bg),
     use_container_width=True,
-    height=_table_height(len(corr)),
+    height=_table_height(len(corr_disp)),
 )
 
 # Most-correlated pairs, weighted by combined position size.
@@ -634,12 +709,24 @@ for i in range(len(cols)):
         if pd.isna(rij):
             continue
         pairs.append({
-            "Pair": f"{a} ↔ {b}",
+            "Pair": f"{name_by_sym.get(a, a)} ↔ {name_by_sym.get(b, b)}",
             "ρ": round(float(rij), 2),
             "Combined weight %": round(float(weights.get(a, 0) + weights.get(b, 0)) * 100, 1),
+            "_sim": str(a).startswith("SIM:") or str(b).startswith("SIM:"),
         })
 if pairs:
     st.subheader("Most-correlated pairs")
-    pdf = pd.DataFrame(pairs).sort_values("ρ", ascending=False).head(15)
-    st.dataframe(pdf, hide_index=True, use_container_width=True,
+    pdf = pd.DataFrame(pairs).sort_values("ρ", ascending=False).head(15).reset_index(drop=True)
+    sim_rows = pdf["_sim"].to_numpy()
+    pdf = pdf.drop(columns="_sim")
+
+    def _hi_sim(row):
+        # Highlight any pair that includes a simulated position.
+        hit = bool(sim_rows[row.name])
+        return ["background-color: #fff3cd; color: black" if hit else ""] * len(row)
+
+    styler = pdf.style.apply(_hi_sim, axis=1)
+    if sim_rows.any():
+        st.caption("Highlighted pairs include a simulated (`SIM:`) position.")
+    st.dataframe(styler, hide_index=True, use_container_width=True,
                  height=_table_height(len(pdf)))
