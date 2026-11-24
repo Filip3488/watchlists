@@ -2751,6 +2751,18 @@ exchanges).
 are noisy, monthly smooths too much; a 1-year window reflects the current regime.
 Correlation is not stable, so try a couple of windows.
 
+**Reading the number.** Because we correlate *returns* (not prices), no two distinct
+companies ever reach `1.0` — there's always company-specific week-to-week noise. A
+rough guide:
+
+| ρ | Interpretation |
+|---|---|
+| ~0.0 | unrelated |
+| 0.3–0.5 | loosely related (same broad market) |
+| 0.6–0.8 | strong sector relationship |
+| 0.85–0.95 | about as tight as two distinct companies get |
+| 1.0 | effectively the same instrument (same stock, different ticker) |
+
 **Pruning helper.** For each highly correlated pair, each stock's **CAGR**
 (annualized price return) is divided by its **annualized volatility** (std. dev. of
 returns × √periods-per-year) to get a return-per-unit-of-risk ratio. We suggest
@@ -2866,7 +2878,7 @@ returns × √periods-per-year) to get a return-per-unit-of-risk ratio. We sugge
         freq = st.radio("Return frequency", list(_CORR_FREQ.keys()),
                         index=1, horizontal=True, key="corr_freq")
     with c_thr:
-        threshold = st.slider("High-correlation threshold", 0.50, 0.99, 0.80, 0.01,
+        threshold = st.slider("High-correlation threshold", 0.50, 0.99, 0.60, 0.01,
                               key="corr_threshold")
         st.caption("Pairs at or above this ρ are flagged as redundancy candidates.")
 
