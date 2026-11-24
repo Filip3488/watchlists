@@ -21,6 +21,8 @@ from pathlib import Path
 import duckdb
 import yfinance as yf
 
+from config import DB_ENV_KEY, DB_DEFAULT, TOKEN_ENV_KEY, TBL_TICKER_NAMES, TBL_ITEMS
+
 
 def _load_env(path: Path) -> None:
     """Minimal .env loader (no extra dependency). Real environment variables win."""
@@ -37,17 +39,17 @@ def _load_env(path: Path) -> None:
 def connect() -> duckdb.DuckDBPyConnection:
     """Open a standalone MotherDuck connection using the local .env (for CLI use)."""
     _load_env(Path(__file__).parent / ".env")
-    token = os.environ.get("MOTHERDUCK_TOKEN")
+    token = os.environ.get(TOKEN_ENV_KEY)
     if not token:
-        raise SystemExit("MOTHERDUCK_TOKEN is not set — add it to EmbeddedTradingView/.env")
+        raise SystemExit(f"{TOKEN_ENV_KEY} is not set — add it to Watchlists/.env")
     os.environ["motherduck_token"] = token
-    return duckdb.connect(f"md:{os.environ.get('DB_NAME', 'watchlists')}")
+    return duckdb.connect(f"md:{os.environ.get(DB_ENV_KEY, DB_DEFAULT)}")
 
 
 def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ticker_names (
+        f"""
+        CREATE TABLE IF NOT EXISTS {TBL_TICKER_NAMES} (
             ticker   TEXT PRIMARY KEY,
             name     TEXT,
             exchange TEXT,
@@ -55,17 +57,17 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
-    cols = [r[1] for r in conn.execute("PRAGMA table_info('ticker_names')").fetchall()]
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info('{TBL_TICKER_NAMES}')").fetchall()]
     if "exchange" not in cols:
-        conn.execute("ALTER TABLE ticker_names ADD COLUMN exchange TEXT")
+        conn.execute(f"ALTER TABLE {TBL_TICKER_NAMES} ADD COLUMN exchange TEXT")
     if "currency" not in cols:
-        conn.execute("ALTER TABLE ticker_names ADD COLUMN currency TEXT")
+        conn.execute(f"ALTER TABLE {TBL_TICKER_NAMES} ADD COLUMN currency TEXT")
 
 
 def _upsert(conn, ticker: str, name: str, exchange: str | None, currency: str | None) -> None:
-    conn.execute("DELETE FROM ticker_names WHERE ticker = ?", [ticker])
+    conn.execute(f"DELETE FROM {TBL_TICKER_NAMES} WHERE ticker = ?", [ticker])
     conn.execute(
-        "INSERT INTO ticker_names (ticker, name, exchange, currency) VALUES (?, ?, ?, ?)",
+        f"INSERT INTO {TBL_TICKER_NAMES} (ticker, name, exchange, currency) VALUES (?, ?, ?, ?)",
         [ticker, name, exchange, currency],
     )
 
@@ -80,14 +82,14 @@ def enrich(conn: duckdb.DuckDBPyConnection, force: bool = False, log=lambda m: N
     """
     _ensure_schema(conn)
     tickers = [r[0] for r in conn.execute(
-        "SELECT DISTINCT ticker FROM items ORDER BY ticker"
+        f"SELECT DISTINCT ticker FROM {TBL_ITEMS} ORDER BY ticker"
     ).fetchall()]
 
     if force:
         todo = tickers
     else:
         have = {r[0] for r in conn.execute(
-            "SELECT ticker FROM ticker_names WHERE name IS NOT NULL AND name <> ''"
+            f"SELECT ticker FROM {TBL_TICKER_NAMES} WHERE name IS NOT NULL AND name <> ''"
         ).fetchall()}
         todo = [t for t in tickers if t not in have]
 

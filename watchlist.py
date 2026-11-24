@@ -10,6 +10,14 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 from populate_names import enrich as enrich_ticker_meta
+from config import (
+    DB_ENV_KEY, DB_DEFAULT, TOKEN_ENV_KEY,
+    TBL_WATCHLISTS, TBL_ITEMS, TBL_STOCK_TAGS, TBL_STOCK_LEVELS,
+    TBL_STOCK_NOTES, TBL_LEVEL_TYPES, TBL_TICKER_NAMES,
+    TBL_PERF_PRESETS, TBL_FILTER_PRESETS, TBL_TAG_GROUPS, TBL_TAG_GROUP_MAP,
+    SEQ_WATCHLISTS, SEQ_ITEMS, SEQ_STOCK_LEVELS,
+    DEFAULT_WATCHLISTS, TAGS, LEVEL_TYPES,
+)
 
 st.set_page_config(page_title="Stock Monitor", layout="wide")
 
@@ -41,29 +49,19 @@ def _secret(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
 
 
-DB_NAME = _secret("DB_NAME", "watchlists")
+DB_NAME = _secret(DB_ENV_KEY, DB_DEFAULT)
 
-DEFAULT_WATCHLISTS = {
-    "US Tech":      ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "ORCL"],
-    "US Finance":   ["JPM", "BAC", "GS", "MS", "WFC", "C", "BLK", "AXP", "V", "MA"],
-    "EU Blue Chips":["SAP.DE", "ASML.AS", "LVMH.PA", "MC.PA", "SIE.DE", "ALV.DE", "BAS.DE", "BMW.DE", "DTE.DE", "ADS.DE"],
-    "Crypto":       ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "AVAX-USD", "DOT-USD", "MATIC-USD"],
-}
-
-TAGS = ["Sell", "Stock up", "Monitor"]
-
-# Level types for the per-stock price-level tracker (Analysis → Levels)
-LEVEL_TYPES = ["Support", "Resistance", "Buy target", "Sell target", "Stop-loss"]
+# DEFAULT_WATCHLISTS, TAGS, LEVEL_TYPES — defined in config.py
 
 
 # ── Database (MotherDuck) ───────────────────────────────────────────────────────
 @st.cache_resource
 def _db() -> duckdb.DuckDBPyConnection:
     """One cached MotherDuck connection for the whole app (auth/handshake once)."""
-    token = _secret("MOTHERDUCK_TOKEN")
+    token = _secret(TOKEN_ENV_KEY)
     if not token:
         st.error(
-            "MOTHERDUCK_TOKEN is not set — add it to EmbeddedTradingView/.env locally, "
+            "MOTHERDUCK_TOKEN is not set — add it to Watchlists/.env locally, "
             "or to the app's Secrets on Streamlit Cloud."
         )
         st.stop()
@@ -81,21 +79,21 @@ def get_conn() -> duckdb.DuckDBPyConnection:
 
 def init_db():
     with get_conn() as conn:
-        conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_watchlists START 1")
-        conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_items START 1")
+        conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {SEQ_WATCHLISTS} START 1")
+        conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {SEQ_ITEMS} START 1")
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS watchlists (
-                id     INTEGER PRIMARY KEY DEFAULT nextval('seq_watchlists'),
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_WATCHLISTS} (
+                id     INTEGER PRIMARY KEY DEFAULT nextval('{SEQ_WATCHLISTS}'),
                 name   TEXT UNIQUE NOT NULL,
                 status TEXT NOT NULL DEFAULT 'target'
             )
             """
         )
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS items (
-                id           INTEGER PRIMARY KEY DEFAULT nextval('seq_items'),
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_ITEMS} (
+                id           INTEGER PRIMARY KEY DEFAULT nextval('{SEQ_ITEMS}'),
                 watchlist_id INTEGER NOT NULL,
                 ticker       TEXT NOT NULL,
                 UNIQUE(watchlist_id, ticker)
@@ -103,19 +101,19 @@ def init_db():
             """
         )
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stock_tags (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_STOCK_TAGS} (
                 ticker TEXT NOT NULL,
                 tag    TEXT NOT NULL,
                 UNIQUE(ticker, tag)
             )
             """
         )
-        conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_stock_levels START 1")
+        conn.execute(f"CREATE SEQUENCE IF NOT EXISTS {SEQ_STOCK_LEVELS} START 1")
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stock_levels (
-                id         INTEGER PRIMARY KEY DEFAULT nextval('seq_stock_levels'),
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_STOCK_LEVELS} (
+                id         INTEGER PRIMARY KEY DEFAULT nextval('{SEQ_STOCK_LEVELS}'),
                 ticker     TEXT    NOT NULL,
                 price      DOUBLE  NOT NULL,
                 level_type TEXT    NOT NULL DEFAULT 'Support',
@@ -124,30 +122,30 @@ def init_db():
             """
         )
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stock_notes (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_STOCK_NOTES} (
                 ticker TEXT PRIMARY KEY,
                 note   TEXT
             )
             """
         )
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS level_types (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_LEVEL_TYPES} (
                 name     TEXT PRIMARY KEY,
                 position INTEGER
             )
             """
         )
         # Seed the level types with the defaults the first time only.
-        if conn.execute("SELECT COUNT(*) FROM level_types").fetchone()[0] == 0:
+        if conn.execute(f"SELECT COUNT(*) FROM {TBL_LEVEL_TYPES}").fetchone()[0] == 0:
             conn.executemany(
-                "INSERT INTO level_types (name, position) VALUES (?, ?)",
+                f"INSERT INTO {TBL_LEVEL_TYPES} (name, position) VALUES (?, ?)",
                 [(name, pos) for pos, name in enumerate(LEVEL_TYPES)],
             )
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ticker_names (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_TICKER_NAMES} (
                 ticker   TEXT PRIMARY KEY,
                 name     TEXT,
                 exchange TEXT,
@@ -156,23 +154,23 @@ def init_db():
             """
         )
         # Migrate older DBs that predate the watchlist status column
-        cols = [r[1] for r in conn.execute("PRAGMA table_info('watchlists')").fetchall()]
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info('{TBL_WATCHLISTS}')").fetchall()]
         if "status" not in cols:
-            conn.execute("ALTER TABLE watchlists ADD COLUMN status TEXT NOT NULL DEFAULT 'target'")
+            conn.execute(f"ALTER TABLE {TBL_WATCHLISTS} ADD COLUMN status TEXT NOT NULL DEFAULT 'target'")
         if "position" not in cols:
-            conn.execute("ALTER TABLE watchlists ADD COLUMN position INTEGER")
-            conn.execute("UPDATE watchlists SET position = id WHERE position IS NULL")
+            conn.execute(f"ALTER TABLE {TBL_WATCHLISTS} ADD COLUMN position INTEGER")
+            conn.execute(f"UPDATE {TBL_WATCHLISTS} SET position = id WHERE position IS NULL")
 
         # Migrate ticker_names created before the exchange/currency columns existed
-        tn_cols = [r[1] for r in conn.execute("PRAGMA table_info('ticker_names')").fetchall()]
+        tn_cols = [r[1] for r in conn.execute(f"PRAGMA table_info('{TBL_TICKER_NAMES}')").fetchall()]
         if "exchange" not in tn_cols:
-            conn.execute("ALTER TABLE ticker_names ADD COLUMN exchange TEXT")
+            conn.execute(f"ALTER TABLE {TBL_TICKER_NAMES} ADD COLUMN exchange TEXT")
         if "currency" not in tn_cols:
-            conn.execute("ALTER TABLE ticker_names ADD COLUMN currency TEXT")
+            conn.execute(f"ALTER TABLE {TBL_TICKER_NAMES} ADD COLUMN currency TEXT")
 
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS perf_presets (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_PERF_PRESETS} (
                 name        TEXT PRIMARY KEY,
                 tickers     TEXT NOT NULL,
                 main_ticker TEXT
@@ -181,13 +179,13 @@ def init_db():
         )
 
         # Migrate perf_presets created before the main_ticker column existed
-        pp_cols = [r[1] for r in conn.execute("PRAGMA table_info('perf_presets')").fetchall()]
+        pp_cols = [r[1] for r in conn.execute(f"PRAGMA table_info('{TBL_PERF_PRESETS}')").fetchall()]
         if "main_ticker" not in pp_cols:
-            conn.execute("ALTER TABLE perf_presets ADD COLUMN main_ticker TEXT")
+            conn.execute(f"ALTER TABLE {TBL_PERF_PRESETS} ADD COLUMN main_ticker TEXT")
 
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS filter_presets (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_FILTER_PRESETS} (
                 scope    TEXT NOT NULL,
                 name     TEXT NOT NULL,
                 settings TEXT NOT NULL,
@@ -197,16 +195,16 @@ def init_db():
         )
 
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tag_groups (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_TAG_GROUPS} (
                 name     TEXT PRIMARY KEY,
                 position INTEGER
             )
             """
         )
         conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tag_group_map (
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_TAG_GROUP_MAP} (
                 tag        TEXT PRIMARY KEY,
                 group_name TEXT NOT NULL
             )
@@ -214,15 +212,15 @@ def init_db():
         )
 
         # Seed defaults only if the DB is empty
-        empty = conn.execute("SELECT COUNT(*) FROM watchlists").fetchone()[0] == 0
+        empty = conn.execute(f"SELECT COUNT(*) FROM {TBL_WATCHLISTS}").fetchone()[0] == 0
         if empty:
             for pos, (name, tickers) in enumerate(DEFAULT_WATCHLISTS.items()):
                 wl_id = conn.execute(
-                    "INSERT INTO watchlists (name, status, position) VALUES (?, 'target', ?) RETURNING id",
+                    f"INSERT INTO {TBL_WATCHLISTS} (name, status, position) VALUES (?, 'target', ?) RETURNING id",
                     [name, pos],
                 ).fetchone()[0]
                 conn.executemany(
-                    "INSERT INTO items (watchlist_id, ticker) VALUES (?, ?)",
+                    f"INSERT INTO {TBL_ITEMS} (watchlist_id, ticker) VALUES (?, ?)",
                     [(wl_id, t) for t in tickers],
                 )
 
@@ -230,10 +228,10 @@ def init_db():
 def get_watchlists() -> dict[str, list[str]]:
     with get_conn() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT w.name, i.ticker
-            FROM watchlists w
-            LEFT JOIN items i ON i.watchlist_id = w.id
+            FROM {TBL_WATCHLISTS} w
+            LEFT JOIN {TBL_ITEMS} i ON i.watchlist_id = w.id
             ORDER BY COALESCE(w.position, w.id), w.id, i.id
             """
         ).fetchall()
@@ -249,10 +247,10 @@ def create_watchlist(name: str, status: str = "target") -> bool:
     try:
         with get_conn() as conn:
             next_pos = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM watchlists"
+                f"SELECT COALESCE(MAX(position), -1) + 1 FROM {TBL_WATCHLISTS}"
             ).fetchone()[0]
             conn.execute(
-                "INSERT INTO watchlists (name, status, position) VALUES (?, ?, ?)",
+                f"INSERT INTO {TBL_WATCHLISTS} (name, status, position) VALUES (?, ?, ?)",
                 [name, status, next_pos],
             )
         return True
@@ -263,29 +261,29 @@ def create_watchlist(name: str, status: str = "target") -> bool:
 def set_watchlist_order(names_in_order: list[str]):
     with get_conn() as conn:
         for pos, name in enumerate(names_in_order):
-            conn.execute("UPDATE watchlists SET position = ? WHERE name = ?", [pos, name])
+            conn.execute(f"UPDATE {TBL_WATCHLISTS} SET position = ? WHERE name = ?", [pos, name])
 
 
 def get_watchlist_statuses() -> dict[str, str]:
     with get_conn() as conn:
-        return dict(conn.execute("SELECT name, status FROM watchlists").fetchall())
+        return dict(conn.execute(f"SELECT name, status FROM {TBL_WATCHLISTS}").fetchall())
 
 
 def set_watchlist_status(name: str, status: str):
     with get_conn() as conn:
-        conn.execute("UPDATE watchlists SET status = ? WHERE name = ?", [status, name])
+        conn.execute(f"UPDATE {TBL_WATCHLISTS} SET status = ? WHERE name = ?", [status, name])
 
 
 def add_item(watchlist_name: str, ticker: str) -> bool:
     try:
         with get_conn() as conn:
             wl = conn.execute(
-                "SELECT id FROM watchlists WHERE name = ?", [watchlist_name]
+                f"SELECT id FROM {TBL_WATCHLISTS} WHERE name = ?", [watchlist_name]
             ).fetchone()
             if wl is None:
                 return False
             conn.execute(
-                "INSERT INTO items (watchlist_id, ticker) VALUES (?, ?)", [wl[0], ticker]
+                f"INSERT INTO {TBL_ITEMS} (watchlist_id, ticker) VALUES (?, ?)", [wl[0], ticker]
             )
         return True
     except duckdb.ConstraintException:
@@ -295,17 +293,17 @@ def add_item(watchlist_name: str, ticker: str) -> bool:
 def delete_watchlist(name: str):
     # DuckDB has no ON DELETE CASCADE, so remove child rows first
     with get_conn() as conn:
-        wl = conn.execute("SELECT id FROM watchlists WHERE name = ?", [name]).fetchone()
+        wl = conn.execute(f"SELECT id FROM {TBL_WATCHLISTS} WHERE name = ?", [name]).fetchone()
         if wl is not None:
-            conn.execute("DELETE FROM items WHERE watchlist_id = ?", [wl[0]])
-            conn.execute("DELETE FROM watchlists WHERE id = ?", [wl[0]])
+            conn.execute(f"DELETE FROM {TBL_ITEMS} WHERE watchlist_id = ?", [wl[0]])
+            conn.execute(f"DELETE FROM {TBL_WATCHLISTS} WHERE id = ?", [wl[0]])
 
 
 def rename_watchlist(old_name: str, new_name: str) -> bool:
     try:
         with get_conn() as conn:
             conn.execute(
-                "UPDATE watchlists SET name = ? WHERE name = ?", [new_name, old_name]
+                f"UPDATE {TBL_WATCHLISTS} SET name = ? WHERE name = ?", [new_name, old_name]
             )
         return True
     except duckdb.ConstraintException:
@@ -315,10 +313,10 @@ def rename_watchlist(old_name: str, new_name: str) -> bool:
 def delete_item(watchlist_name: str, ticker: str):
     with get_conn() as conn:
         conn.execute(
-            """
-            DELETE FROM items
+            f"""
+            DELETE FROM {TBL_ITEMS}
             WHERE ticker = ?
-              AND watchlist_id = (SELECT id FROM watchlists WHERE name = ?)
+              AND watchlist_id = (SELECT id FROM {TBL_WATCHLISTS} WHERE name = ?)
             """,
             [ticker, watchlist_name],
         )
@@ -326,7 +324,7 @@ def delete_item(watchlist_name: str, ticker: str):
 
 def get_tags_map() -> dict[str, list[str]]:
     with get_conn() as conn:
-        rows = conn.execute("SELECT ticker, tag FROM stock_tags ORDER BY ticker, tag").fetchall()
+        rows = conn.execute(f"SELECT ticker, tag FROM {TBL_STOCK_TAGS} ORDER BY ticker, tag").fetchall()
     result: dict[str, list[str]] = {}
     for ticker, tag in rows:
         result.setdefault(ticker, []).append(tag)
@@ -338,7 +336,7 @@ def get_tags(ticker: str) -> list[str]:
         return [
             r[0]
             for r in conn.execute(
-                "SELECT tag FROM stock_tags WHERE ticker = ? ORDER BY tag", [ticker]
+                f"SELECT tag FROM {TBL_STOCK_TAGS} WHERE ticker = ? ORDER BY tag", [ticker]
             ).fetchall()
         ]
 
@@ -346,10 +344,10 @@ def get_tags(ticker: str) -> list[str]:
 def set_tags(ticker: str, tags: list[str]):
     """Replace the full set of tags for a ticker."""
     with get_conn() as conn:
-        conn.execute("DELETE FROM stock_tags WHERE ticker = ?", [ticker])
+        conn.execute(f"DELETE FROM {TBL_STOCK_TAGS} WHERE ticker = ?", [ticker])
         if tags:
             conn.executemany(
-                "INSERT INTO stock_tags (ticker, tag) VALUES (?, ?)",
+                f"INSERT INTO {TBL_STOCK_TAGS} (ticker, tag) VALUES (?, ?)",
                 [(ticker, tg) for tg in tags],
             )
 
@@ -357,7 +355,7 @@ def set_tags(ticker: str, tags: list[str]):
 def get_all_tags() -> list[str]:
     """All known tags: the predefined set plus any user-created ones in the DB."""
     with get_conn() as conn:
-        used = [r[0] for r in conn.execute("SELECT DISTINCT tag FROM stock_tags").fetchall()]
+        used = [r[0] for r in conn.execute(f"SELECT DISTINCT tag FROM {TBL_STOCK_TAGS}").fetchall()]
     return sorted(set(TAGS) | set(used))
 
 
@@ -366,7 +364,7 @@ def get_levels(ticker: str) -> list[dict]:
     """Price levels recorded for one ticker, ordered by price."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, price, level_type, note FROM stock_levels "
+            f"SELECT id, price, level_type, note FROM {TBL_STOCK_LEVELS} "
             "WHERE ticker = ? ORDER BY price",
             [ticker],
         ).fetchall()
@@ -380,7 +378,7 @@ def get_levels_map() -> dict[str, list[dict]]:
     """All price levels grouped by ticker (for watchlist/monitor overlays)."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT ticker, id, price, level_type, note FROM stock_levels "
+            f"SELECT ticker, id, price, level_type, note FROM {TBL_STOCK_LEVELS} "
             "ORDER BY ticker, price"
         ).fetchall()
     result: dict[str, list[dict]] = {}
@@ -394,10 +392,10 @@ def get_levels_map() -> dict[str, list[dict]]:
 def replace_levels(ticker: str, levels: list[dict]):
     """Replace the full set of price levels for a ticker."""
     with get_conn() as conn:
-        conn.execute("DELETE FROM stock_levels WHERE ticker = ?", [ticker])
+        conn.execute(f"DELETE FROM {TBL_STOCK_LEVELS} WHERE ticker = ?", [ticker])
         if levels:
             conn.executemany(
-                "INSERT INTO stock_levels (ticker, price, level_type, note) "
+                f"INSERT INTO {TBL_STOCK_LEVELS} (ticker, price, level_type, note) "
                 "VALUES (?, ?, ?, ?)",
                 [
                     (ticker, lv["price"], lv["level_type"], lv.get("note") or None)
@@ -410,7 +408,7 @@ def get_stock_note(ticker: str) -> str:
     """The free-text general comment for a ticker ("" if none)."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT note FROM stock_notes WHERE ticker = ?", [ticker]
+            f"SELECT note FROM {TBL_STOCK_NOTES} WHERE ticker = ?", [ticker]
         ).fetchone()
     return (row[0] if row else "") or ""
 
@@ -419,7 +417,7 @@ def get_stock_notes_map() -> dict[str, str]:
     """All per-stock general comments keyed by ticker (blank notes excluded)."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT ticker, note FROM stock_notes ORDER BY ticker"
+            f"SELECT ticker, note FROM {TBL_STOCK_NOTES} ORDER BY ticker"
         ).fetchall()
     return {t: n for t, n in rows if (n or "").strip()}
 
@@ -428,7 +426,7 @@ def get_level_types() -> list[str]:
     """The user-maintained list of level types (falls back to defaults if empty)."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT name FROM level_types ORDER BY COALESCE(position, 999), name"
+            f"SELECT name FROM {TBL_LEVEL_TYPES} ORDER BY COALESCE(position, 999), name"
         ).fetchall()
     return [r[0] for r in rows] or list(LEVEL_TYPES)
 
@@ -442,10 +440,10 @@ def set_level_types(names: list[str]):
             seen.add(n)
             ordered.append(n)
     with get_conn() as conn:
-        conn.execute("DELETE FROM level_types")
+        conn.execute(f"DELETE FROM {TBL_LEVEL_TYPES}")
         if ordered:
             conn.executemany(
-                "INSERT INTO level_types (name, position) VALUES (?, ?)",
+                f"INSERT INTO {TBL_LEVEL_TYPES} (name, position) VALUES (?, ?)",
                 [(n, pos) for pos, n in enumerate(ordered)],
             )
 
@@ -454,17 +452,17 @@ def set_stock_note(ticker: str, note: str):
     """Upsert the general comment for a ticker; blank removes it."""
     note = (note or "").strip()
     with get_conn() as conn:
-        conn.execute("DELETE FROM stock_notes WHERE ticker = ?", [ticker])
+        conn.execute(f"DELETE FROM {TBL_STOCK_NOTES} WHERE ticker = ?", [ticker])
         if note:
             conn.execute(
-                "INSERT INTO stock_notes (ticker, note) VALUES (?, ?)", [ticker, note]
+                f"INSERT INTO {TBL_STOCK_NOTES} (ticker, note) VALUES (?, ?)", [ticker, note]
             )
 
 
 def get_tag_groups() -> list[str]:
     with get_conn() as conn:
         return [r[0] for r in conn.execute(
-            "SELECT name FROM tag_groups ORDER BY COALESCE(position, 999), name"
+            f"SELECT name FROM {TBL_TAG_GROUPS} ORDER BY COALESCE(position, 999), name"
         ).fetchall()]
 
 
@@ -472,9 +470,9 @@ def create_tag_group(name: str) -> bool:
     try:
         with get_conn() as conn:
             next_pos = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM tag_groups"
+                f"SELECT COALESCE(MAX(position), -1) + 1 FROM {TBL_TAG_GROUPS}"
             ).fetchone()[0]
-            conn.execute("INSERT INTO tag_groups (name, position) VALUES (?, ?)", [name, next_pos])
+            conn.execute(f"INSERT INTO {TBL_TAG_GROUPS} (name, position) VALUES (?, ?)", [name, next_pos])
         return True
     except duckdb.ConstraintException:
         return False
@@ -482,15 +480,15 @@ def create_tag_group(name: str) -> bool:
 
 def delete_tag_group(name: str):
     with get_conn() as conn:
-        conn.execute("DELETE FROM tag_group_map WHERE group_name = ?", [name])
-        conn.execute("DELETE FROM tag_groups WHERE name = ?", [name])
+        conn.execute(f"DELETE FROM {TBL_TAG_GROUP_MAP} WHERE group_name = ?", [name])
+        conn.execute(f"DELETE FROM {TBL_TAG_GROUPS} WHERE name = ?", [name])
 
 
 def rename_tag_group(old: str, new: str) -> bool:
     try:
         with get_conn() as conn:
-            conn.execute("UPDATE tag_group_map SET group_name = ? WHERE group_name = ?", [new, old])
-            conn.execute("UPDATE tag_groups SET name = ? WHERE name = ?", [new, old])
+            conn.execute(f"UPDATE {TBL_TAG_GROUP_MAP} SET group_name = ? WHERE group_name = ?", [new, old])
+            conn.execute(f"UPDATE {TBL_TAG_GROUPS} SET name = ? WHERE name = ?", [new, old])
         return True
     except duckdb.ConstraintException:
         return False
@@ -499,15 +497,15 @@ def rename_tag_group(old: str, new: str) -> bool:
 def get_tag_group_map() -> dict[str, str]:
     """Returns {tag: group_name} for all tags that have been assigned to a group."""
     with get_conn() as conn:
-        return dict(conn.execute("SELECT tag, group_name FROM tag_group_map").fetchall())
+        return dict(conn.execute(f"SELECT tag, group_name FROM {TBL_TAG_GROUP_MAP}").fetchall())
 
 
 def set_tag_group(tag: str, group_name: str | None):
     with get_conn() as conn:
-        conn.execute("DELETE FROM tag_group_map WHERE tag = ?", [tag])
+        conn.execute(f"DELETE FROM {TBL_TAG_GROUP_MAP} WHERE tag = ?", [tag])
         if group_name:
             conn.execute(
-                "INSERT INTO tag_group_map (tag, group_name) VALUES (?, ?)", [tag, group_name]
+                f"INSERT INTO {TBL_TAG_GROUP_MAP} (tag, group_name) VALUES (?, ?)", [tag, group_name]
             )
 
 
@@ -517,7 +515,7 @@ def get_ticker_meta() -> dict[str, tuple]:
     names/exchange/currency only from here — it never calls yfinance for them."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT ticker, name, exchange, currency FROM ticker_names"
+            f"SELECT ticker, name, exchange, currency FROM {TBL_TICKER_NAMES}"
         ).fetchall()
     return {t: (n, e, c) for t, n, e, c in rows}
 
@@ -526,11 +524,11 @@ def set_ticker_name(ticker: str, name: str):
     """Set (or clear, when blank) the manual display name, preserving exchange/currency."""
     name = (name or "").strip() or None
     with get_conn() as conn:
-        exists = conn.execute("SELECT 1 FROM ticker_names WHERE ticker = ?", [ticker]).fetchone()
+        exists = conn.execute(f"SELECT 1 FROM {TBL_TICKER_NAMES} WHERE ticker = ?", [ticker]).fetchone()
         if exists:
-            conn.execute("UPDATE ticker_names SET name = ? WHERE ticker = ?", [name, ticker])
+            conn.execute(f"UPDATE {TBL_TICKER_NAMES} SET name = ? WHERE ticker = ?", [name, ticker])
         elif name:
-            conn.execute("INSERT INTO ticker_names (ticker, name) VALUES (?, ?)", [ticker, name])
+            conn.execute(f"INSERT INTO {TBL_TICKER_NAMES} (ticker, name) VALUES (?, ?)", [ticker, name])
 
 
 init_db()
@@ -1469,7 +1467,7 @@ def render_edit_screen(watchlists: dict[str, list[str]]):
     # ── Set a watchlist's status (held vs target) ──────────────────────────────
     with tab_status:
         if not watchlists:
-            st.info("No watchlists to update.")
+            st.info(f"No {TBL_WATCHLISTS} to update.")
         else:
             statuses = get_watchlist_statuses()
             s_list = st.selectbox(
@@ -1674,7 +1672,7 @@ def render_edit_screen(watchlists: dict[str, list[str]]):
     # ── Delete a whole watchlist ───────────────────────────────────────────────
     with tab_del_list:
         if not watchlists:
-            st.info("No watchlists to delete.")
+            st.info(f"No {TBL_WATCHLISTS} to delete.")
         else:
             del_wl = st.selectbox("Watchlist to delete", list(watchlists.keys()), key="del_wl")
             count = len(watchlists.get(del_wl, []))
@@ -1712,7 +1710,7 @@ def render_refresh_screen():
 
 def get_perf_presets() -> dict[str, dict]:
     with get_conn() as conn:
-        rows = conn.execute("SELECT name, tickers, main_ticker FROM perf_presets ORDER BY name").fetchall()
+        rows = conn.execute(f"SELECT name, tickers, main_ticker FROM {TBL_PERF_PRESETS} ORDER BY name").fetchall()
     return {
         name: {"tickers": tickers.split(","), "main_ticker": main_ticker}
         for name, tickers, main_ticker in rows
@@ -1722,8 +1720,8 @@ def get_perf_presets() -> dict[str, dict]:
 def save_perf_preset(name: str, tickers: list[str], main_ticker: str | None = None):
     with get_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO perf_presets (name, tickers, main_ticker) VALUES (?, ?, ?)
+            f"""
+            INSERT INTO {TBL_PERF_PRESETS} (name, tickers, main_ticker) VALUES (?, ?, ?)
             ON CONFLICT (name) DO UPDATE SET tickers = excluded.tickers, main_ticker = excluded.main_ticker
             """,
             [name, ",".join(tickers), main_ticker or None],
@@ -1732,14 +1730,14 @@ def save_perf_preset(name: str, tickers: list[str], main_ticker: str | None = No
 
 def delete_perf_preset(name: str):
     with get_conn() as conn:
-        conn.execute("DELETE FROM perf_presets WHERE name = ?", [name])
+        conn.execute(f"DELETE FROM {TBL_PERF_PRESETS} WHERE name = ?", [name])
 
 
 # ── Filter presets (saved filter/grouping configurations per monitor view) ──────
 def get_filter_presets(scope: str) -> dict[str, dict]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT name, settings FROM filter_presets WHERE scope = ? ORDER BY name",
+            f"SELECT name, settings FROM {TBL_FILTER_PRESETS} WHERE scope = ? ORDER BY name",
             [scope],
         ).fetchall()
     out: dict[str, dict] = {}
@@ -1754,8 +1752,8 @@ def get_filter_presets(scope: str) -> dict[str, dict]:
 def save_filter_preset(scope: str, name: str, settings: dict):
     with get_conn() as conn:
         conn.execute(
-            """
-            INSERT INTO filter_presets (scope, name, settings) VALUES (?, ?, ?)
+            f"""
+            INSERT INTO {TBL_FILTER_PRESETS} (scope, name, settings) VALUES (?, ?, ?)
             ON CONFLICT (scope, name) DO UPDATE SET settings = excluded.settings
             """,
             [scope, name, json.dumps(settings)],
@@ -1765,7 +1763,7 @@ def save_filter_preset(scope: str, name: str, settings: dict):
 def delete_filter_preset(scope: str, name: str):
     with get_conn() as conn:
         conn.execute(
-            "DELETE FROM filter_presets WHERE scope = ? AND name = ?", [scope, name]
+            f"DELETE FROM {TBL_FILTER_PRESETS} WHERE scope = ? AND name = ?", [scope, name]
         )
 
 
@@ -2098,10 +2096,10 @@ def render_performance_page():
 
     # ── Ticker selector ───────────────────────────────────────────────────────
     with get_conn() as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT DISTINCT i.ticker, COALESCE(n.name, i.ticker) AS display_name
-            FROM items i
-            LEFT JOIN ticker_names n ON n.ticker = i.ticker
+            FROM {TBL_ITEMS} i
+            LEFT JOIN {TBL_TICKER_NAMES} n ON n.ticker = i.ticker
             ORDER BY i.ticker
         """).fetchall()
 
@@ -2134,7 +2132,7 @@ def render_performance_page():
                     st.session_state["perf_main_ticker"] = p["main_ticker"]
                 if len(valid) < len(p["tickers"]):
                     missing = set(p["tickers"]) - set(valid)
-                    st.warning(f"Skipped {len(missing)} ticker(s) no longer in your watchlists: {', '.join(sorted(missing))}")
+                    st.warning(f"Skipped {len(missing)} ticker(s) no longer in your {TBL_WATCHLISTS}: {', '.join(sorted(missing))}")
                 st.session_state.pop("perf_ticker_source", None)
                 st.rerun()
         with del_col:
@@ -2776,10 +2774,10 @@ returns × √periods-per-year) to get a return-per-unit-of-risk ratio. We sugge
     # ── Ticker selection ──────────────────────────────────────────────────────
     # ── Ticker selection (mirrors the Performance tab, split by axis) ─────────
     with get_conn() as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT DISTINCT i.ticker, COALESCE(n.name, i.ticker) AS display_name
-            FROM items i
-            LEFT JOIN ticker_names n ON n.ticker = i.ticker
+            FROM {TBL_ITEMS} i
+            LEFT JOIN {TBL_TICKER_NAMES} n ON n.ticker = i.ticker
             ORDER BY i.ticker
         """).fetchall()
     if not rows:
@@ -3105,10 +3103,10 @@ def render_levels_page():
     )
 
     with get_conn() as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT DISTINCT i.ticker, COALESCE(n.name, i.ticker) AS display_name
-            FROM items i
-            LEFT JOIN ticker_names n ON n.ticker = i.ticker
+            FROM {TBL_ITEMS} i
+            LEFT JOIN {TBL_TICKER_NAMES} n ON n.ticker = i.ticker
             ORDER BY i.ticker
         """).fetchall()
     if not rows:
