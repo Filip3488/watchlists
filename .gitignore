@@ -2,6 +2,9 @@
 .env
 .streamlit/secrets.toml
 
+# Private portfolio data — stays local, never committed
+portfolio_data/
+
 # Local databases (the app uses MotherDuck now; these are local leftovers)
 *.duckdb
 *.db

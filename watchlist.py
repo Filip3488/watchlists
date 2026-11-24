@@ -18,6 +18,9 @@ from config import (
     SEQ_WATCHLISTS, SEQ_ITEMS, SEQ_STOCK_LEVELS,
     DEFAULT_WATCHLISTS, TAGS, LEVEL_TYPES,
 )
+from core import (
+    _CORR_WINDOWS, _CORR_FREQ, _fetch_perf_history, _corr_ticker_stats,
+)
 
 st.set_page_config(page_title="Stock Monitor", layout="wide")
 
@@ -1767,37 +1770,7 @@ def delete_filter_preset(scope: str, name: str):
         )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_perf_history(tickers_tuple: tuple[str, ...], auto_adjust: bool = True) -> dict[str, pd.Series]:
-    """Download up to 11 years of daily close prices in one batched call.
-    auto_adjust=True  → adjusted close (total return incl. dividends)
-    auto_adjust=False → unadjusted close (price return only)"""
-    if not tickers_tuple:
-        return {}
-    try:
-        data = yf.download(
-            list(tickers_tuple),
-            period="16y",
-            interval="1d",
-            group_by="ticker",
-            progress=False,
-            threads=True,
-            auto_adjust=auto_adjust,
-        )
-    except Exception:
-        return {}
-    if data is None or data.empty:
-        return {}
-    out: dict[str, pd.Series] = {}
-    multi = isinstance(data.columns, pd.MultiIndex)
-    for t in tickers_tuple:
-        try:
-            closes = (data[t]["Close"] if multi else data["Close"]).dropna()
-            if not closes.empty:
-                out[t] = closes
-        except Exception:
-            continue
-    return out
+# _fetch_perf_history moved to core.py (shared with portfolio.py)
 
 
 def _calc_performance(series: pd.Series) -> dict[str, float | None]:
@@ -2689,39 +2662,8 @@ def render_color_settings_page():
 
 # ── Correlation analysis ────────────────────────────────────────────────────────
 # Lookback windows: label → date offset back from the latest available date.
-_CORR_WINDOWS: dict[str, "pd.DateOffset | None"] = {
-    "6M": pd.DateOffset(months=6),
-    "1Y": pd.DateOffset(years=1),
-    "2Y": pd.DateOffset(years=2),
-    "3Y": pd.DateOffset(years=3),
-    "5Y": pd.DateOffset(years=5),
-    "Max": None,
-}
-# Return frequency: label → (resample rule, periods/year for annualizing, min obs
-# required per pair). The minimum scales with frequency so monthly returns aren't
-# wiped out by a daily-sized threshold (a 1Y monthly window only has ~12 points).
-_CORR_FREQ: dict[str, tuple[str | None, int, int]] = {
-    "Daily":   (None,    252, 20),
-    "Weekly":  ("W-FRI",  52, 12),
-    "Monthly": ("ME",     12,  8),
-}
 
-
-def _corr_ticker_stats(prices: pd.Series, rets: pd.Series, periods_per_year: int) -> dict:
-    """Per-ticker return/risk over the window: CAGR, annualized volatility, and their
-    ratio (a Sharpe-like return-per-unit-of-risk with a 0% risk-free rate)."""
-    p = prices.dropna()
-    r = rets.dropna()
-    out = {"cagr": None, "vol": None, "ratio": None}
-    if len(p) >= 2:
-        years = (p.index[-1] - p.index[0]).days / 365.25
-        if years > 0 and p.iloc[0] > 0:
-            out["cagr"] = (p.iloc[-1] / p.iloc[0]) ** (1 / years) - 1
-    if len(r) >= 2:
-        out["vol"] = float(r.std() * (periods_per_year ** 0.5))
-    if out["cagr"] is not None and out["vol"]:
-        out["ratio"] = out["cagr"] / out["vol"]
-    return out
+# _CORR_WINDOWS, _CORR_FREQ, _corr_ticker_stats moved to core.py (shared with portfolio.py)
 
 
 def render_correlation_page():
