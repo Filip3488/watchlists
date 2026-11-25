@@ -23,6 +23,7 @@ TBL_PERF_PRESETS   = "perf_presets"
 TBL_FILTER_PRESETS = "filter_presets"
 TBL_TAG_GROUPS     = "tag_groups"
 TBL_TAG_GROUP_MAP  = "tag_group_map"
+TBL_LEVEL_ALERT_DISMISS = "level_alert_dismiss"
 
 # ── Sequence names ────────────────────────────────────────────────────────────
 SEQ_WATCHLISTS   = "seq_watchlists"

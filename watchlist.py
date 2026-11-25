@@ -16,6 +16,7 @@ from config import (
     TBL_WATCHLISTS, TBL_ITEMS, TBL_STOCK_TAGS, TBL_STOCK_LEVELS,
     TBL_STOCK_NOTES, TBL_LEVEL_TYPES, TBL_TICKER_NAMES,
     TBL_PERF_PRESETS, TBL_FILTER_PRESETS, TBL_TAG_GROUPS, TBL_TAG_GROUP_MAP,
+    TBL_LEVEL_ALERT_DISMISS,
     SEQ_WATCHLISTS, SEQ_ITEMS, SEQ_STOCK_LEVELS,
     DEFAULT_WATCHLISTS, TAGS, LEVEL_TYPES,
 )
@@ -131,6 +132,16 @@ def init_db():
             CREATE TABLE IF NOT EXISTS {TBL_STOCK_NOTES} (
                 ticker TEXT PRIMARY KEY,
                 note   TEXT
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TBL_LEVEL_ALERT_DISMISS} (
+                level_id     INTEGER NOT NULL,
+                cross_date   VARCHAR NOT NULL,
+                dismissed_at TIMESTAMP,
+                PRIMARY KEY (level_id, cross_date)
             )
             """
         )
@@ -407,6 +418,120 @@ def replace_levels(ticker: str, levels: list[dict]):
                     for lv in levels
                 ],
             )
+
+
+# ── Level-crossing alerts ─────────────────────────────────────────────────────
+# A level counts as crossed on day D when it falls within the reach of the move
+# into that day — i.e. between the previous close and the day's own high/low:
+#     min(prev_close, low_D) ≤ level ≤ max(prev_close, high_D)
+# This catches close-to-close crossings, intraday wicks that reverted, AND
+# overnight gaps straight through the level. Every qualifying day is reported.
+# Prices are UNADJUSTED (auto_adjust=False), matching the basis levels are
+# recorded on. Detection is stateless; the only persisted state is the set of
+# crossings you have dismissed.
+ALERT_LOOKBACK_DAYS = 10   # trading days scanned on each load
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _recent_ohlc(tickers_tuple: tuple[str, ...], period: str = "3mo") -> dict[str, pd.DataFrame]:
+    """Batched UNADJUSTED daily OHLC for several tickers (for crossing detection)."""
+    if not tickers_tuple:
+        return {}
+    try:
+        data = yf.download(list(tickers_tuple), period=period, interval="1d",
+                           group_by="ticker", auto_adjust=False, progress=False, threads=True)
+    except Exception:
+        return {}
+    if data is None or data.empty:
+        return {}
+    out: dict[str, pd.DataFrame] = {}
+    multi = isinstance(data.columns, pd.MultiIndex)
+    for t in tickers_tuple:
+        try:
+            sub = data[t] if multi else data
+            keep = [c for c in ("Open", "High", "Low", "Close") if c in sub.columns]
+            df = sub[keep].dropna()
+            if not df.empty:
+                out[t] = df
+        except Exception:
+            continue
+    return out
+
+
+def compute_level_crossings(levels_map: dict[str, list[dict]],
+                            ohlc: dict[str, pd.DataFrame],
+                            lookback: int = ALERT_LOOKBACK_DAYS) -> list[dict]:
+    """All level crossings within the last ``lookback`` trading days (every
+    qualifying day, not collapsed). See the module note above for the rule."""
+    out: list[dict] = []
+    for t, lvls in levels_map.items():
+        df = ohlc.get(t)
+        if df is None or len(df) < 2:
+            continue
+        win = df.tail(lookback + 1)   # +1 so the first in-window day has a prev close
+        if len(win) < 2:
+            continue
+        closes = win["Close"].to_numpy(dtype=float)
+        highs = win["High"].to_numpy(dtype=float)
+        lows = win["Low"].to_numpy(dtype=float)
+        dates = [d.strftime("%Y-%m-%d") for d in win.index]
+        for lv in lvls:
+            L = float(lv["price"])
+            for i in range(1, len(win)):
+                pc = closes[i - 1]
+                if min(pc, lows[i]) <= L <= max(pc, highs[i]):
+                    if pc < L:
+                        direction = "up"
+                    elif pc > L:
+                        direction = "down"
+                    else:
+                        direction = "up" if closes[i] >= L else "down"
+                    out.append({
+                        "level_id": lv["id"], "ticker": t, "price": L,
+                        "level_type": lv["level_type"], "note": lv.get("note", ""),
+                        "date": dates[i], "direction": direction, "close": closes[i],
+                    })
+    return out
+
+
+def get_dismissed_alerts() -> set[tuple[int, str]]:
+    """The (level_id, cross_date) pairs the user has dismissed."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT level_id, cross_date FROM {TBL_LEVEL_ALERT_DISMISS}"
+        ).fetchall()
+    return {(int(r[0]), str(r[1])) for r in rows}
+
+
+def dismiss_alerts(pairs: list[tuple[int, str]]):
+    """Mark (level_id, cross_date) crossings as dismissed. Idempotent."""
+    pairs = list(pairs)
+    if not pairs:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            f"INSERT INTO {TBL_LEVEL_ALERT_DISMISS} (level_id, cross_date, dismissed_at) "
+            "VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+            [(int(lid), str(cd), datetime.now()) for lid, cd in pairs],
+        )
+
+
+def clean_dismissals(valid_level_ids: set[int], window_start: str):
+    """Housekeeping: drop dismissals that can no longer surface — those older than
+    the lookback window (``cross_date < window_start``) and those whose level was
+    deleted (``level_id`` no longer present)."""
+    ids = [int(i) for i in valid_level_ids]
+    with get_conn() as conn:
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"DELETE FROM {TBL_LEVEL_ALERT_DISMISS} "
+                f"WHERE cross_date < ? OR level_id NOT IN ({placeholders})",
+                [window_start, *ids],
+            )
+        else:
+            # No levels at all → every dismissal is orphaned.
+            conn.execute(f"DELETE FROM {TBL_LEVEL_ALERT_DISMISS}")
 
 
 def get_stock_note(ticker: str) -> str:
@@ -3120,6 +3245,20 @@ def _render_level_charts(ticker: str, name: str, levels: list[dict]):
 
 # ── Stock levels page ────────────────────────────────────────────────────────
 def render_levels_page():
+    # Handle a "dismiss" link click from the alerts table (same-tab navigation
+    # to ?lvldismiss=<level_id>&d=<cross_date>): record it, clear the params,
+    # and rerun back to a clean Levels page.
+    _dq = st.query_params.get("lvldismiss")
+    if _dq:
+        try:
+            dismiss_alerts([(int(_dq), st.query_params.get("d", ""))])
+        except Exception:
+            pass
+        for _k in ("lvldismiss", "d"):
+            if _k in st.query_params:
+                del st.query_params[_k]
+        st.rerun()
+
     st.title("🎚️ Levels")
     st.caption(
         "Record the price levels that matter for each stock — support, resistance, "
@@ -3227,6 +3366,69 @@ def render_levels_page():
             with st.spinner("Fetching current prices…"):
                 quotes = fetch_quotes(recorded)
             price_map = dict(zip(quotes["Ticker"], quotes["Price"]))
+
+            # ── Level-crossing alerts ───────────────────────────────────────────
+            tickers_with_levels = tuple(sorted(levels_map))
+            if tickers_with_levels:
+                with st.spinner("Checking for level crossings…"):
+                    ohlc_recent = _recent_ohlc(tickers_with_levels)
+                all_cross = compute_level_crossings(levels_map, ohlc_recent)
+                dismissed = get_dismissed_alerts()
+                # Housekeeping: drop aged + orphaned dismissals in one pass.
+                valid_ids = {lv["id"] for lvls in levels_map.values() for lv in lvls}
+                win_start = (datetime.now().date()
+                             - timedelta(days=max(30, ALERT_LOOKBACK_DAYS * 3))).strftime("%Y-%m-%d")
+                clean_dismissals(valid_ids, win_start)
+
+                active = [c for c in all_cross
+                          if (c["level_id"], c["date"]) not in dismissed]
+                active.sort(key=lambda c: (c["date"], c["ticker"]), reverse=True)
+
+                if active:
+                    h_l, h_r = st.columns([4, 1])
+                    h_l.markdown(
+                        f"#### 🔔 {len(active)} level crossing(s) · last "
+                        f"{ALERT_LOOKBACK_DAYS} trading days"
+                    )
+                    if h_r.button("Dismiss all", key="lvl_alert_dismiss_all",
+                                  use_container_width=True):
+                        dismiss_alerts([(c["level_id"], c["date"]) for c in active])
+                        st.rerun()
+
+                    rows_html = ""
+                    for c in active:
+                        arrow = "▲" if c["direction"] == "up" else "▼"
+                        col = "#28a745" if c["direction"] == "up" else "#d9534f"
+                        note = (
+                            f"<code>{html.escape(c['ticker'])}</code> crossed "
+                            f"<b>{c['price']:g}</b> "
+                            f"<span style='color:{col};font-weight:600'>{arrow} "
+                            f"{html.escape(c['direction'])}</span> on <b>{c['date']}</b> "
+                            f"<span style='color:#888'>(close {c['close']:.2f})</span>"
+                        )
+                        href = f"?lvldismiss={c['level_id']}&d={quote(c['date'])}"
+                        rows_html += (
+                            f"<tr><td>{note}</td>"
+                            f"<td>{html.escape(c['level_type'])}</td>"
+                            f"<td class='dismiss'><a href='{href}' target='_self'>dismiss</a></td></tr>"
+                        )
+                    st.markdown(
+                        """
+<style>
+.lvl-alert-tbl { width:100%; border-collapse:collapse; font-size:0.9rem; margin:0.3rem 0 0.2rem; }
+.lvl-alert-tbl th, .lvl-alert-tbl td { text-align:left; padding:7px 10px; border-bottom:1px solid #e6e6e6; }
+.lvl-alert-tbl th { background:#f3f5f8; font-weight:600; }
+.lvl-alert-tbl td.dismiss { white-space:nowrap; }
+.lvl-alert-tbl td.dismiss a { color:#2962ff; text-decoration:underline; cursor:pointer; }
+</style>
+<table class="lvl-alert-tbl">
+<thead><tr><th>Notification</th><th>Type</th><th>Dismiss</th></tr></thead>
+<tbody>"""
+                        + rows_html
+                        + "</tbody></table>",
+                        unsafe_allow_html=True,
+                    )
+                    st.divider()
 
             rows = []
             for t in recorded:
